@@ -1,0 +1,27 @@
+# Progress & session files
+wp_pro_progress.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets (never commit keys!)
+.env
+secrets.toml
+.streamlit/secrets.toml
+
+# Outputs
+*.zip
+*.tar.gz
