@@ -287,6 +287,113 @@ hr{border-color:rgba(127,119,221,0.1) !important}
 </style>
 """, unsafe_allow_html=True)
 
+# Theme CSS
+st.markdown("""
+<style>
+/* Light Theme Overrides */
+[data-theme="light"] .stApp,
+[data-theme="light"] section[data-testid="stMain"] {
+    background: #f8f9fa !important;
+}
+
+[data-theme="light"] [data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #ffffff 0%, #e9ecef 100%) !important;
+    border-right: 1px solid rgba(0,0,0,0.1) !important;
+}
+
+[data-theme="light"] [data-testid="stSidebar"] * {
+    color: #495057 !important;
+}
+
+[data-theme="light"] [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+    color: rgba(73, 80, 87, 0.6) !important;
+}
+
+[data-theme="light"] [data-testid="stSidebar"] input,
+[data-theme="light"] [data-testid="stSidebar"] [data-baseweb="select"]>div {
+    background: rgba(255,255,255,0.9) !important;
+    border: 1px solid rgba(0,0,0,0.2) !important;
+    color: #1a1a1a !important;
+}
+
+[data-theme="light"] .stTextArea textarea,
+[data-theme="light"] .stTextInput input,
+[data-theme="light"] textarea,
+[data-theme="light"] input[type="text"],
+[data-theme="light"] input[type="password"],
+[data-theme="light"] input[type="number"] {
+    background: rgba(255,255,255,0.9) !important;
+    border: 1px solid rgba(0,0,0,0.2) !important;
+    color: #1a1a1a !important;
+    caret-color: #7F77DD !important;
+}
+
+[data-theme="light"] .stTextArea textarea::placeholder,
+[data-theme="light"] .stTextInput input::placeholder {
+    color: rgba(73, 80, 87, 0.4) !important;
+}
+
+[data-theme="light"] [data-testid="stToggle"] label,
+[data-theme="light"] [data-testid="stRadio"] label {
+    color: #495057 !important;
+}
+
+[data-theme="light"] [data-testid="stMetric"] {
+    background: rgba(255,255,255,0.8) !important;
+    border: 1px solid rgba(0,0,0,0.1) !important;
+}
+
+[data-theme="light"] [data-testid="stMetricLabel"] {
+    color: #495057 !important;
+}
+
+[data-theme="light"] [data-testid="stMetricValue"] {
+    color: #1a1a1a !important;
+}
+
+[data-theme="light"] hr {
+    border-color: rgba(0,0,0,0.1) !important;
+}
+
+[data-theme="light"] [data-testid="stExpander"] {
+    background: rgba(255,255,255,0.8) !important;
+    border: 1px solid rgba(0,0,0,0.1) !important;
+}
+
+[data-theme="light"] [data-testid="stExpander"] summary {
+    color: #495057 !important;
+}
+
+[data-theme="light"] .conn-pill {
+    background: rgba(255,255,255,0.8) !important;
+    border: 1px solid rgba(0,0,0,0.1) !important;
+    color: #495057 !important;
+}
+
+[data-theme="light"] .stButton>button:not([kind="primary"]) {
+    background: rgba(255,255,255,0.8) !important;
+    border: 1px solid rgba(0,0,0,0.2) !important;
+    color: #495057 !important;
+}
+
+[data-theme="light"] .stButton>button:not([kind="primary"]):hover {
+    background: rgba(127,119,221,0.12) !important;
+    color: #7F77DD !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# Apply theme
+if "theme" not in st.session_state:
+    st.session_state.theme = "dark"
+
+# Set theme attribute on HTML
+st.markdown(f"""
+<script>
+    document.documentElement.setAttribute('data-theme', '{st.session_state.theme}');
+</script>
+""", unsafe_allow_html=True)
+
 # ════════════════════════════════════════════════════════════
 #  CONSTANTS & HELPERS
 # ════════════════════════════════════════════════════════════
@@ -512,7 +619,7 @@ def ai_pick_category(title, content_text, categories_dict, prov, key, model, fb=
 #  SESSION STATE
 # ════════════════════════════════════════════════════════════
 for k, v in [("posts",[]),("selected",[]),("active_tab","dashboard"),
-             ("run_log",[]),("created_log",[])]:
+             ("run_log",[]),("created_log",[]),("theme","dark")]:
     if k not in st.session_state: st.session_state[k] = v
 
 # ════════════════════════════════════════════════════════════
@@ -526,6 +633,13 @@ with st.sidebar:
       <div style='font-size:11px;color:rgba(255,255,255,0.4)'>Local Desktop Edition</div>
     </div>
     """, unsafe_allow_html=True)
+
+    # Theme toggle
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col3:
+        if st.button("🌙", help="Toggle Light/Dark Mode"):
+            st.session_state.theme = "light" if st.session_state.theme == "dark" else "dark"
+            st.rerun()
 
     st.markdown("SITE")
     domain  = st.text_input("Domain", value="", label_visibility="collapsed", placeholder="yourdomain.com")
