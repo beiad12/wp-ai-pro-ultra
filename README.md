@@ -1,109 +1,89 @@
-# ⚡ WP AI Pro Ultra — Local Desktop Edition
+# ⚡ WP AI Pro Ultra — Local Agency Edition
 
-> A powerful AI content studio for WordPress. Runs 100% locally on your PC — no Colab, no ngrok, no subscriptions.
+A local-only Streamlit app for agencies managing multiple WordPress sites: AI content generation, SEO tools, and a full technical/security/performance/content audit suite with real, working one-click fixes — fronted by a conversational Agent tab.
+
+Runs 100% on your own PC at `http://localhost:8501`. No Colab, no ngrok, no cloud hosting, no subscriptions.
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.35%2B-red?logo=streamlit)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-1.0.0-orange)
 
 ---
 
-## ✨ What it does
+## 🚀 Installation
 
-| Feature | Details |
-|---|---|
-| 🤖 **AI content writing** | Generate full blog posts from topics — with intros, subheadings, CTAs |
-| 🖼️ **Featured images** | Auto-generate & upload images via Pollinations (free) or DALL-E 3 |
-| 🔍 **SEO optimization** | Meta descriptions, focus keywords, Yoast/RankMath integration |
-| 📅 **Smart scheduling** | Spread up to 500 posts/day evenly across 24 hours automatically |
-| 🔧 **Post optimizer** | Fix, rewrite, and improve existing WordPress posts in bulk |
-| 📊 **Schema.org JSON-LD** | Auto-inject structured data for better Google rankings |
-| 🏷️ **AI category picker** | Automatically assigns the right category to each post |
-| ⚡ **Multi-provider AI** | Claude, OpenAI, Gemini, Mistral — with auto-fallback chain |
-| 🛡️ **Quality gate** | Skip posts that don't meet minimum word count |
-| 💾 **Resume mode** | Crash recovery — pick up exactly where you left off |
-| 📥 **CSV export** | Download full results log for every run |
+**Windows:**
+1. Download and unzip this project
+2. Double-click `run_windows.bat` — it installs dependencies and launches the app with the *same* Python interpreter (avoids the classic "installed but ModuleNotFoundError" mismatch)
 
----
-
-## 🚀 Installation — Windows
-
-**Step 1:** Download and unzip this project
-
-**Step 2:** Double-click `install.bat`
-
-**Step 3:** Double-click `START.bat`
-
-The app opens automatically at **http://localhost:8501** 🎉
-
----
-
-## 🚀 Installation — Mac / Linux
-
+**Mac / Linux:**
 ```bash
-# 1. Clone the repo
 git clone https://github.com/YOUR_USERNAME/wp-ai-pro-ultra.git
 cd wp-ai-pro-ultra
-
-# 2. Install & launch (one command)
-chmod +x start.sh && ./start.sh
+chmod +x run_mac_linux.sh && ./run_mac_linux.sh
 ```
 
-The app opens at **http://localhost:8501**
+Or manually, from this folder, using one Python interpreter for both steps:
+```bash
+python -m pip install -r requirements.txt
+python -m streamlit run app.py
+```
+
+The app opens automatically at **http://localhost:8501**.
+
+Core dependencies (`streamlit`, `beautifulsoup4`, `pandas`, `Pillow`, `fpdf2`) are required. The AI provider SDKs (`anthropic`, `openai`, `google-generativeai`) are optional — if one isn't installed, only that provider is disabled with a clear message; the app still starts and Mistral (plain HTTP, no SDK needed) still works.
 
 ---
 
 ## ⚙️ Setup in the app
 
-### 1. Connect your WordPress site
-- **Domain:** `yourdomain.com` (no https://)
-- **Username:** your WP admin username
-- **App Password:** Generate at **WP Admin → Users → Profile → Application Passwords**
+In the sidebar:
+- **Domain, WP username, WP Application Password** — generate an App Password at WP Admin → Users → Profile → Application Passwords (works better than your real WP password, and can be revoked independently).
+- **AI provider + model + API key** — Claude, OpenAI, Mistral, or Gemini, plus optional fallback keys for other providers.
+- **Image provider** — Pollinations (free, no key) or DALL-E 3 (needs an OpenAI key).
+- **PageSpeed API key** (optional) — raises the rate limit for Core Web Vitals checks; works keyless at low volume.
+- **Agency/brand name** and **your name** — used in PDF reports and the Agent's greeting.
+- **Sandbox / Live toggle** — Sandbox previews every write (post edits, plugin installs, image uploads); nothing touches your live site until you switch it off.
 
-### 2. Add an AI key (at least one)
+### Saved site profiles
+Under **💾 Saved Sites** in the sidebar: fill in a site's details, give the profile a name, and save it. Next session, pick it from the dropdown and everything — credentials, AI keys, preferences — is restored instantly. No re-typing between client sites.
 
-| Provider | Free Tier | Get key |
-|---|---|---|
-| **Google Gemini** | ✅ Yes | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
-| **Groq** | ✅ Yes (fast) | [console.groq.com/keys](https://console.groq.com/keys) |
-| **OpenAI** | ❌ Paid | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
-| **Anthropic Claude** | ❌ Paid | [console.anthropic.com](https://console.anthropic.com) |
-| **Mistral** | ❌ Paid | [console.mistral.ai](https://console.mistral.ai) |
-
-### 3. Go to Sandbox → OFF when ready to go live
+**Where it's stored:** plain-text local JSON files next to `app.py` — `wp_pro_profiles.json` (site profiles) and `wp_pro_settings.json` (cross-site preferences like your name). Convenient for your own machine, but they contain real passwords and API keys in plaintext — **don't share this folder, commit it to a repo, or sync it anywhere untrusted.** These files are already excluded via `.gitignore`.
 
 ---
 
-## 📖 How to use
+## ✨ Features
 
-### Create 100 posts on a schedule
-1. Go to **✨ Create Posts**
-2. Paste 100 topics (one per line)
-3. Set **Posts per day = 50** → 1 post every 29 minutes
-4. Enable **Smart Scheduling**
-5. Click **Generate & schedule posts**
-6. WordPress automatically publishes them over time ✅
+### Content tools
+- **Scan & Select** — fetch all posts (paginated), filter by status/missing image, search, bulk select.
+- **Optimize Posts** — AI rewrite with custom instructions, minimum word-count quality gate, auto-category detection, resumable/crash-safe batch runs, concurrent workers.
+- **Fix Images** — generate + upload featured images with SEO alt text for posts missing one (Pollinations free, or DALL-E 3).
+- **Create Posts** — multi-topic batch creation with full SEO metadata, schema.org JSON-LD, and smart scheduling spread across a target posts/day rate over 24 hours. Sandbox previews before anything publishes.
+- **SEO Tools** — meta description + focus keyword generation, pushed straight to Yoast/RankMath fields.
 
-### Fix missing images
-1. Go to **📡 Scan & Select** → scan your site
-2. Click **🚫 Without image only**
-3. Go to **🖼️ Fix Images** → click Generate
+### 🩺 Site Health — audit suite with real fixes
+Each check below is its own sub-tab with its own "Run" button, plus one "Run full audit" on the Overview tab that runs everything and saves a timestamped snapshot to local per-domain history:
 
-### Bulk SEO optimization
-1. Scan your site
-2. Select posts
-3. Go to **🔍 SEO Tools** → Run SEO
+- **Technical** — SSL validity/expiry, response time, page weight, GZIP/Brotli compression, title/meta length, viewport tag, single-H1 check, homepage image alt text, robots.txt, sitemap.xml.
+- **Security** — HSTS, clickjacking protection, CSP, X-Content-Type-Options, Referrer-Policy, XML-RPC exposure, upload directory listing, WP version disclosure, username enumeration — all via plain HTTP, no WP-admin login needed.
+- **Performance** — real Core Web Vitals (LCP, CLS, TBT, FCP) via the Google PageSpeed Insights API.
+- **SEO Crawl** — crawls up to N live post URLs for duplicate titles/meta, missing meta/canonical/OG tags, broken pages, bad H1 counts, orphan pages.
+- **Content Quality** — Flesch readability, near-duplicate detection, stale-content flagging, missing images, thin content — each with an immediate ⚡ Fix now.
+- **Reports** — branded PDF export, CSV export, and the full scan-history table for the current domain.
+
+**Real fixes, not fake buttons:** XML-RPC and missing security headers install & activate verified, actively-maintained plugins via the `wp/v2/plugins` REST endpoint (handles the "already installed" case, and fails cleanly with manual steps on hosts that require FTP for installs). Slow LCP/FCP installs a caching plugin. High CLS gets a genuine mechanical fix — posts are scanned for `<img>` tags missing `width`/`height`, real pixel sizes are fetched, and the attributes are written back via the REST API. Everything respects Sandbox mode. Things that genuinely need `.htaccess`, hosting-panel, or WP-admin-only access (robots.txt content, version-tag removal, directory-listing config, plugin/theme updates, database optimization, malware scanning, user-account audits) get a clear written recommendation instead of a fake button — see in-app explanations for why.
+
+### 🤖 The Agent tab
+Replaces the old static dashboard. On load: a typing indicator, then a time-of-day + name-based greeting, then an offer to run today's check. Say yes and it runs the full audit and summarizes the results in plain language with an action-chip menu (load posts, fix missing images, fix thin/stale content, improve SEO meta, speed up the site, harden security, create posts, get a PDF report, re-run the check). Every action reuses the exact same functions as their dedicated tabs — nothing duplicated — and respects Sandbox mode identically.
 
 ---
 
 ## 🔑 Tips
 
-- **Always start with Sandbox ON** — preview before going live
-- **Pollinations is free** for image generation — no key needed
-- **Resume mode** saves progress — safe to close and reopen
-- **Workers = 2** is safe for most hosts; increase for VPS
-- **App Passwords** work better than your main WP password
+- Always start with **Sandbox ON** to preview before going live.
+- Pollinations is free for image generation — no key required.
+- Resume mode saves progress to a local JSON file — safe to close and reopen mid-batch.
+- Workers = 2 is safe for most hosts; increase for a VPS.
 
 ---
 
@@ -111,35 +91,24 @@ The app opens at **http://localhost:8501**
 
 ```
 wp-ai-pro-ultra/
-├── app.py              ← Main Streamlit app
-├── requirements.txt    ← Python dependencies
-├── install.bat         ← Windows one-click installer
-├── START.bat           ← Windows launcher (opens browser automatically)
-├── start.sh            ← Mac/Linux launcher
+├── app.py                ← Main Streamlit app (single file)
+├── requirements.txt       ← Python dependencies
+├── run_windows.bat        ← Windows one-click install + launch
+├── run_mac_linux.sh       ← Mac/Linux one-click install + launch
 └── README.md
 ```
 
+Local state files (created on first use, gitignored, plaintext — own machine only):
+`wp_pro_profiles.json` (saved site profiles + secrets), `wp_pro_settings.json` (cross-site preferences), `wp_pro_progress.json` (crash-safe batch resume state), `wp_pro_health_history.json` (per-domain score history).
+
 ---
 
-## 🤝 Contributing
+## 🚫 Explicitly out of scope
 
-Pull requests welcome! Ideas:
-- [ ] Gutenberg block editor support
-- [ ] WooCommerce product creator
-- [ ] Bulk internal linking
-- [ ] Multi-site dashboard
-- [ ] Export to WordPress XML
+This app never fakes automation for things it genuinely doesn't have access to: plugin/theme *updates*, database optimization, malware scanning, user-account audits, robots.txt content edits, WP version-tag removal, directory-listing configuration, or `.htaccess` edits. Where these come up in an audit, you get a specific written recommendation instead of a button.
 
 ---
 
 ## 📄 License
 
 MIT — free to use, modify, and distribute.
-
----
-
-## 🙏 Credits
-
-- AI: Claude (Anthropic), GPT-4 (OpenAI), Gemini (Google), Mistral, Groq
-- Images: Pollinations.ai, DALL-E 3
-- UI: Streamlit

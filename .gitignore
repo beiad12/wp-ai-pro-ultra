@@ -1,5 +1,8 @@
-# Progress & session files
+# Progress, profiles & local state (contains plaintext secrets)
 wp_pro_progress.json
+wp_pro_profiles.json
+wp_pro_settings.json
+wp_pro_health_history.json
 
 # Python
 __pycache__/
