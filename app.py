@@ -1020,6 +1020,116 @@ def fix_image_dimensions_now(posts, auth, target_domain, is_dry_run=True, max_im
                 results.append({"id": pid, "title": title, "status": "error", "detail": friendly_error(e)})
     return results
 
+def build_and_publish_post(topic, domain, auth, *, language="English",
+                            tone="Informative & SEO-optimized", word_count=800,
+                            wp_status="draft", date_iso=None, do_image=True, do_seo=True,
+                            do_schema=True, auto_category=True, manual_category_id=None,
+                            tag_ids=None, is_dry_run=True, progress_cb=None):
+    """Writes one AI post and (unless dry-run) publishes it to WordPress via the
+    real REST API — the single code path used by both the Create Posts tab and
+    the Agent's create_post tool, so neither one can drift out of sync."""
+    def _log(msg):
+        if progress_cb: progress_cb(msg)
+
+    result = {"topic": topic, "ok": False, "post_id": None, "link": None,
+              "meta_desc": "", "focus_kw": "", "excerpt": "", "content_html": "",
+              "category_name": None, "category_id": None, "image_alt": "",
+              "image_bytes": None, "wp_status": wp_status, "date_iso": date_iso, "error": None}
+    try:
+        _log("✍️ Writing content...")
+        sys_c = ("You are an expert SEO content writer and WordPress editor. "
+                 "Write well-structured HTML using h2, h3, p, ul, strong tags. "
+                 "No html/head/body/title tags. No markdown fences. Raw HTML only.")
+        p_c = (f"Blog post about: {topic}\nLanguage: {language}\nTone: {tone}\n"
+               f"~{word_count} words. Include intro, subheadings, tips, CTA.\nReturn HTML body only.")
+        post_html = run_ai(p_c, provider, ai_key, ai_model, 0.6, sys_c,
+                           enable_fallback, fallback_keys).replace("```html", "").replace("```", "").strip()
+
+        meta_desc = focus_kw = exc_text = ""
+        if do_seo:
+            _log("🔍 Generating SEO meta...")
+            plain = BeautifulSoup(post_html, "html.parser").get_text()
+            seo = generate_seo_meta(topic, plain, provider, ai_key, ai_model, enable_fallback, fallback_keys)
+            meta_desc = seo.get("meta_description", "")
+            focus_kw  = seo.get("focus_keyword", "")
+            exc_text  = seo.get("excerpt", "")
+        result["meta_desc"], result["focus_kw"], result["excerpt"] = meta_desc, focus_kw, exc_text
+
+        if do_schema:
+            tag = ('<script type="application/ld+json">'
+                   + generate_schema_jsonld(topic, f"https://{domain}/",
+                                            (date_iso or datetime.utcnow().isoformat()),
+                                            meta_desc or exc_text)
+                   + '</script>')
+            post_html = tag + "\n" + post_html
+        result["content_html"] = post_html
+
+        img_bytes, seo_alt = None, ""
+        if do_image:
+            _log("🎨 Generating featured image...")
+            raw = run_ai(f"2-sentence photorealistic image prompt for '{topic}'. Raw text only.",
+                         provider, ai_key, ai_model, 0.1,
+                         enable_fallback=enable_fallback, fallback_keys=fallback_keys)
+            ipr = " ".join(raw.replace("*", "").replace('"', "").split())[:800]
+            seo_alt = run_ai(f"SEO image alt text under 120 chars for '{topic}'. No quotes.",
+                             provider, ai_key, ai_model, 0.1,
+                             enable_fallback=enable_fallback, fallback_keys=fallback_keys).replace('"', "")
+            for attempt in range(3):
+                try:
+                    use_dalle = image_provider == "DALL-E 3" and bool(dalle_key or ai_key)
+                    img_bytes = gen_image_dalle(ipr, dalle_key or ai_key, dalle_style) if use_dalle else gen_image_pollinations(ipr)
+                    break
+                except Exception as ie:
+                    if attempt == 2:
+                        result["error"] = f"Image failed: {ie}"
+                    else:
+                        time.sleep(3)
+        result["image_alt"], result["image_bytes"] = seo_alt, img_bytes
+
+        if is_dry_run:
+            result["ok"] = True
+            return result
+
+        media_id = None
+        if img_bytes:
+            try:
+                media_id = upload_wp_image(img_bytes, topic, seo_alt, auth, domain, optimize_seo_img)
+            except Exception as ue:
+                result["error"] = f"Upload failed: {ue}"
+
+        pl = {"title": topic, "content": post_html, "status": wp_status, "excerpt": exc_text}
+        if media_id: pl["featured_media"] = media_id
+        if date_iso: pl["date"] = date_iso
+
+        resolved_cat = None
+        if auto_category:
+            wp_cats = fetch_wp_categories(auth, domain)
+            if wp_cats:
+                plain_txt = BeautifulSoup(post_html, "html.parser").get_text()
+                resolved_cat = ai_pick_category(topic, plain_txt, wp_cats, provider, ai_key, ai_model,
+                                                enable_fallback, fallback_keys)
+                if resolved_cat:
+                    result["category_name"] = next((n for n, cid in wp_cats.items() if cid == resolved_cat), "?")
+        elif manual_category_id:
+            resolved_cat = manual_category_id
+        if resolved_cat:
+            pl["categories"] = [resolved_cat]
+            result["category_id"] = resolved_cat
+        if tag_ids:
+            pl["tags"] = tag_ids
+
+        r = wp_create_post(pl, auth, domain)
+        if r and r.status_code == 201:
+            new_id, new_link = r.json().get("id"), r.json().get("link", "")
+            if do_seo and meta_desc:
+                update_yoast_meta(new_id, meta_desc, focus_kw, auth, domain)
+            result.update(ok=True, post_id=new_id, link=new_link)
+        else:
+            result["error"] = f"HTTP {r.status_code if r else 'no response'}"
+    except Exception as e:
+        result["error"] = friendly_error(e)
+    return result
+
 # ════════════════════════════════════════════════════════════
 #  SITE HEALTH & PERFORMANCE ANALYZER
 # ════════════════════════════════════════════════════════════
@@ -1566,8 +1676,216 @@ for k, v in [("posts",[]),("selected",[]),("active_tab","dashboard"),
              ("health_content",None),("security_results",None),
              ("crawl_results",None),("cwv_results",None),
              ("content_quality_results",None),("prefill_fix_instructions",""),
-             ("_fix_toast",None)]:
+             ("_fix_toast",None),("agent_plan",[])]:
     if k not in st.session_state: st.session_state[k] = v
+
+# ════════════════════════════════════════════════════════════
+#  AGENT TOOL-CALLING  (Stage 2) — a fixed, whitelisted registry of real
+#  functions the connected LLM may plan against. It never writes or executes
+#  code itself; it only proposes {tool, args} steps from this exact list,
+#  which get shown to the user for confirmation before anything real runs.
+# ════════════════════════════════════════════════════════════
+AGENT_TOOLS = {
+    "load_posts": {
+        "desc": "Fetch posts from WordPress into memory. Args: statuses (list of 'publish'/'draft'/'private', "
+                "default ['publish']), max_count (int, 0 = all, default 0)."},
+    "run_full_audit": {
+        "desc": "Run the full site health audit — technical, security, performance, SEO crawl, content quality. No args."},
+    "fix_missing_images": {
+        "desc": "Generate & upload AI featured images with SEO alt text for posts missing one. "
+                "Args: max_count (int, 0 = all, default 0)."},
+    "rewrite_thin_stale_content": {
+        "desc": "AI-rewrite posts that are thin (under the quality-gate word count) or stale (not updated "
+                "recently). Args: max_count (int, 0 = all, default 0), instructions (optional extra rewrite instructions)."},
+    "fix_seo_meta": {
+        "desc": "Generate and push a meta description + focus keyword to Yoast/RankMath for posts missing one. "
+                "Args: max_count (int, 0 = all, default 0)."},
+    "fix_image_dimensions": {
+        "desc": "Scan post images missing width/height attributes and write real pixel dimensions to fix "
+                "layout shift (CLS). No args."},
+    "install_caching_plugin": {
+        "desc": "Install & activate a verified caching plugin (WP Super Cache) to speed up LCP/FCP. "
+                "Requires Sandbox mode OFF. No args."},
+    "harden_security": {
+        "desc": "Install & activate verified security plugins (Disable XML-RPC, Really Simple Security). "
+                "Requires Sandbox mode OFF. No args."},
+    "generate_pdf_report": {
+        "desc": "Build a branded PDF report from the most recent scan results. No args."},
+    "create_post": {
+        "desc": "Write and publish one new AI-generated blog post with SEO meta, a featured image, and schema.org "
+                "markup. Args: topic (string, required), word_count (int, default 800), "
+                "publish (bool, default false — false publishes as a draft for review)."},
+}
+
+def run_agent_planner(user_request, context_summary):
+    """Asks the connected LLM to turn a free-text request into a short plan of
+    steps drawn ONLY from AGENT_TOOLS. Returns {"reply": str, "steps": [...]}.
+    Any tool name the model invents that isn't in the registry is dropped —
+    the model proposes, it never executes."""
+    tools_desc = "\n".join(f"- {name}: {meta['desc']}" for name, meta in AGENT_TOOLS.items())
+    system = (
+        "You are the planning brain for a WordPress agency assistant. You never write or run code yourself — "
+        "you only choose from this fixed list of whitelisted tools and respond with strict JSON, nothing else, "
+        "no markdown fences, no commentary outside the JSON.\n\n"
+        f"Available tools:\n{tools_desc}\n\n"
+        "Respond with exactly this JSON shape:\n"
+        '{"reply": "one short friendly sentence about the plan", '
+        '"steps": [{"tool": "<tool name>", "args": {}, "why": "short reason"}]}\n\n'
+        "Rules: use only tool names from the list above, at most 5 steps, only include args the tool actually "
+        "accepts. If the request doesn't match any tool, return an empty steps list and explain why in reply."
+    )
+    prompt = f"Site context: {context_summary}\n\nUser request: {user_request}"
+    try:
+        raw = run_ai(prompt, provider, ai_key, ai_model, 0.2, system, enable_fallback, fallback_keys).strip()
+    except Exception as e:
+        return {"reply": f"I couldn't reach the AI provider to plan that: {friendly_error(e)}", "steps": []}
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"): raw = raw[4:]
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {"reply": "I couldn't build a clear plan from that — try rephrasing, or use the menu above.", "steps": []}
+
+    clean_steps = []
+    for step in (data.get("steps") or [])[:5]:
+        tool = step.get("tool")
+        if tool not in AGENT_TOOLS:
+            continue
+        args = step.get("args") if isinstance(step.get("args"), dict) else {}
+        clean_steps.append({"tool": tool, "args": args, "why": step.get("why", "")})
+    return {"reply": data.get("reply") or "Here's what I'd do:", "steps": clean_steps}
+
+def execute_agent_tool(tool, args, auth, domain, is_dry_run):
+    """Runs one whitelisted agent tool call for real, through the exact same
+    wrapper functions as the dedicated tabs. Returns (ok: bool, message: str)."""
+    args = args or {}
+
+    if tool == "load_posts":
+        statuses = [s for s in (args.get("statuses") or ["publish"]) if s in ("publish", "draft", "private")] or ["publish"]
+        posts = fetch_all_posts(auth, domain, statuses, int(args.get("max_count") or 0))
+        st.session_state.posts = posts
+        st.session_state.selected = [p["id"] for p in posts]
+        return True, f"Loaded {len(posts)} post(s) from {domain}."
+
+    if tool == "run_full_audit":
+        try: st.session_state.health_results = run_site_health_check(domain)
+        except Exception: pass
+        try: st.session_state.security_results = run_security_check(domain)
+        except Exception: pass
+        st.session_state.cwv_results = check_core_web_vitals(domain, pagespeed_key)
+        if st.session_state.posts:
+            try: st.session_state.crawl_results = crawl_site_seo(st.session_state.posts, crawl_max_pages)
+            except Exception: pass
+            st.session_state.health_content = analyze_content_health(st.session_state.posts, gate_min_words)
+            st.session_state.content_quality_results = analyze_content_quality_at_scale(st.session_state.posts, stale_days)
+        return True, "Full audit complete — see the Site Health tab for details."
+
+    if tool == "fix_missing_images":
+        targets = [p["id"] for p in st.session_state.posts if not p.get("featured_media")]
+        if args.get("max_count"): targets = targets[:int(args["max_count"])]
+        if not targets: return True, "Every post already has a featured image."
+        if not ai_key: return False, "I need an AI API key in the sidebar first."
+        results = apply_content_fix_now(targets, "image", auth, domain, is_dry_run=is_dry_run)
+        ok_n = sum(1 for r in results if r["status"] == "ok")
+        if is_dry_run: return True, f"🟡 Sandbox preview — {ok_n} post(s) would get a new featured image."
+        st.session_state.health_content = analyze_content_health(st.session_state.posts, gate_min_words)
+        return True, f"Generated and attached images to {ok_n} post(s). ✅"
+
+    if tool == "rewrite_thin_stale_content":
+        thin = [p["id"] for p in st.session_state.posts
+                if len(BeautifulSoup(p.get("content", {}).get("rendered", ""), "html.parser").get_text().split()) < gate_min_words]
+        now, stale = datetime.utcnow(), []
+        for p in st.session_state.posts:
+            mod = p.get("modified") or p.get("date")
+            try:
+                if (now - datetime.fromisoformat(mod.replace("Z", ""))).days > stale_days:
+                    stale.append(p["id"])
+            except Exception:
+                pass
+        targets = list(set(thin + stale))
+        if args.get("max_count"): targets = targets[:int(args["max_count"])]
+        if not targets: return True, "Nothing thin or stale right now."
+        if not ai_key: return False, "I need an AI API key in the sidebar first."
+        instructions = args.get("instructions") or (
+            "Expand thin sections with more useful detail, and refresh anything outdated with current "
+            "information. Keep the same topic and tone.")
+        results = apply_content_fix_now(targets, "rewrite", auth, domain,
+                                        extra_instructions=instructions, is_dry_run=is_dry_run)
+        ok_n = sum(1 for r in results if r["status"] == "ok")
+        if is_dry_run: return True, f"🟡 Sandbox preview — {ok_n} post(s) would be rewritten."
+        st.session_state.health_content = analyze_content_health(st.session_state.posts, gate_min_words)
+        st.session_state.content_quality_results = analyze_content_quality_at_scale(st.session_state.posts, stale_days)
+        return True, f"Improved {ok_n} post(s). ✅"
+
+    if tool == "fix_seo_meta":
+        targets = [p["id"] for p in st.session_state.posts if not p.get("excerpt", {}).get("rendered", "").strip()]
+        if args.get("max_count"): targets = targets[:int(args["max_count"])]
+        if not targets: return True, "Every loaded post already has a meta description."
+        if not ai_key: return False, "I need an AI API key in the sidebar first."
+        results = apply_content_fix_now(targets, "meta", auth, domain, is_dry_run=is_dry_run)
+        ok_n = sum(1 for r in results if r["status"] == "ok")
+        if is_dry_run: return True, f"🟡 Sandbox preview — {ok_n} post(s) would get new meta descriptions."
+        return True, f"Wrote meta descriptions & focus keywords for {ok_n} post(s). ✅"
+
+    if tool == "fix_image_dimensions":
+        if not st.session_state.posts: return False, "Load posts first."
+        results = fix_image_dimensions_now(st.session_state.posts, auth, domain, is_dry_run=is_dry_run)
+        fixed = sum(1 for r in results if r["status"] == "ok" and "Preview" not in r["detail"] and "No images" not in r["detail"])
+        if is_dry_run: return True, f"🟡 Sandbox preview — dimensions would be added on {fixed} post(s)."
+        return True, f"Added missing image dimensions on {fixed} post(s). ✅"
+
+    if tool == "install_caching_plugin":
+        if is_dry_run: return False, "Sandbox mode is on — turn it off to install a plugin (can't be previewed)."
+        ok, msg = wp_install_plugin("wp-super-cache", auth, domain)
+        return ok, msg + (" Finish in WP Admin → Settings → WP Super Cache → Easy tab → 'Caching On'." if ok else "")
+
+    if tool == "harden_security":
+        if is_dry_run: return False, "Sandbox mode is on — turn it off to install plugins (can't be previewed)."
+        ok1, msg1 = wp_install_plugin("disable-xml-rpc", auth, domain)
+        ok2, msg2 = wp_install_plugin("really-simple-ssl", auth, domain)
+        return (ok1 and ok2), f"XML-RPC: {msg1}\nHeaders: {msg2} Finish the setup in WP Admin → Really Simple Security."
+
+    if tool == "generate_pdf_report":
+        has_any = any([st.session_state.health_results, st.session_state.security_results,
+                       st.session_state.crawl_results, st.session_state.content_quality_results])
+        if not has_any: return False, "No scan results yet — run the audit first."
+        def score(issues):
+            if not issues: return None
+            return round(sum(1 for r in issues if r["status"] == "pass") / len(issues) * 100)
+        scores = {
+            "Technical": score(st.session_state.health_results),
+            "Security": score(st.session_state.security_results),
+            "SEO": score((st.session_state.crawl_results or {}).get("issues")) if st.session_state.crawl_results else None,
+            "Content": score(st.session_state.content_quality_results),
+            "Performance": st.session_state.cwv_results.get("overall_score")
+                if st.session_state.cwv_results and not st.session_state.cwv_results.get("error") else None,
+        }
+        groups = [
+            ("Technical & Performance", st.session_state.health_results or []),
+            ("Security", st.session_state.security_results or []),
+            ("Site-wide SEO Crawl", (st.session_state.crawl_results or {}).get("issues", [])),
+            ("Content Quality", st.session_state.content_quality_results or []),
+            ("Content Health", st.session_state.health_content or []),
+        ]
+        st.session_state["_agent_pdf"] = generate_pdf_report(domain, agency_name, scores, groups)
+        return True, "Your report's ready — download it below. 📄"
+
+    if tool == "create_post":
+        topic = (args.get("topic") or "").strip()
+        if not topic: return False, "I need a topic to write about."
+        if not ai_key: return False, "I need an AI API key in the sidebar first."
+        word_count = int(args.get("word_count") or 800)
+        publish = bool(args.get("publish"))
+        r = build_and_publish_post(topic, domain, auth, word_count=word_count,
+                                   wp_status=("publish" if publish else "draft"), is_dry_run=is_dry_run)
+        if is_dry_run:
+            return True, f"🟡 Sandbox preview — would create '{topic}' ({word_count} words, {'publish' if publish else 'draft'})."
+        if r["ok"]:
+            return True, f"Created post #{r['post_id']} — {r['link']} ✅"
+        return False, f"Couldn't create the post: {r['error']}"
+
+    return False, f"Unknown tool: {tool}"
 
 # ════════════════════════════════════════════════════════════
 #  SIDEBAR
@@ -2153,9 +2471,61 @@ if active == "dashboard":
         if not posts_loaded:
             st.caption("Some actions need your posts loaded first — try 'Load my posts' to unlock them.")
 
+    # ── Free-text tool-calling (Stage 2) ─────────────────────
+    if st.session_state.agent_step in ("menu", "offer_check") and not st.session_state.agent_plan:
+        st.markdown("<div style='padding-top:14px;font-size:12px;color:var(--text-muted)'>Or tell me what to do, in your own words</div>",
+                    unsafe_allow_html=True)
+        fc1, fc2 = st.columns([5, 1])
+        with fc1:
+            free_text = st.text_input("Free text request", key="agent_free_text",
+                                       placeholder="e.g. optimize my thin posts and generate images for anything missing one",
+                                       label_visibility="collapsed")
+        with fc2:
+            plan_clicked = st.button("Plan it →", key="agent_plan_btn", use_container_width=True,
+                                      disabled=not (free_text.strip() and ai_key and domain))
+        if not ai_key:
+            st.caption("Add an AI API key in the sidebar to unlock free-text requests.")
+        if plan_clicked and free_text.strip():
+            _agent_user(free_text.strip())
+            no_img_n = sum(1 for p in st.session_state.posts if not p.get("featured_media"))
+            context_summary = (f"{len(st.session_state.posts)} post(s) loaded, {no_img_n} missing images, "
+                               f"sandbox={'on' if dry_run else 'off'}, connected to {domain}.")
+            with st.spinner("Planning..."):
+                plan = run_agent_planner(free_text.strip(), context_summary)
+            st.session_state.agent_plan = plan["steps"]
+            _agent_say(plan["reply"] if plan["steps"] else plan["reply"] + " Try the menu above instead.")
+            st.rerun()
+
+    # ── Plan confirmation — nothing here runs until the user approves ────
+    if st.session_state.agent_plan:
+        st.markdown("<div class='panel-box' style='margin-top:10px'>", unsafe_allow_html=True)
+        st.markdown("**Proposed steps** — review before I run anything:")
+        keep = []
+        for i, step in enumerate(st.session_state.agent_plan):
+            args_str = f" _(args: {step['args']})_" if step["args"] else ""
+            checked = st.checkbox(f"**{step['tool']}** — {step.get('why','')}{args_str}",
+                                   value=True, key=f"agent_plan_step_{i}")
+            if checked: keep.append(step)
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            if st.button("▶️ Run selected steps", type="primary", use_container_width=True, key="agent_plan_run"):
+                auth = make_auth(wp_user, wp_pw) if (wp_user and wp_pw) else None
+                for step in keep:
+                    ok, msg = execute_agent_tool(step["tool"], step["args"], auth, domain, dry_run)
+                    _agent_say(("✅ " if ok else "⚠️ ") + msg)
+                st.session_state.agent_plan = []
+                st.rerun()
+        with pc2:
+            if st.button("✖️ Discard plan", use_container_width=True, key="agent_plan_discard"):
+                st.session_state.agent_plan = []
+                _agent_say("Okay, discarded that plan.")
+                st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
     st.markdown("<div style='padding-top:8px'></div>", unsafe_allow_html=True)
     if st.button("🔄 Start a new conversation", key="agent_reset"):
         st.session_state.agent_log = []
+        st.session_state.agent_plan = []
         st.session_state.agent_step = "start"
         st.session_state["_agent_pdf"] = None
         st.rerun()
@@ -3228,53 +3598,21 @@ elif active == "create":
             col1, col2 = st.columns([3,1])
 
             try:
-                with col1: st.info("✍️ Writing content...")
-                sys_c = ("You are an expert SEO content writer and WordPress editor. "
-                         "Write well-structured HTML using h2, h3, p, ul, strong tags. "
-                         "No html/head/body/title tags. No markdown fences. Raw HTML only.")
-                p_c   = (f"Blog post about: {topic}\nLanguage: {fix_lang}\nTone: {fix_tone}\n"
-                         f"~{fix_words} words. Include intro, subheadings, tips, CTA.\nReturn HTML body only.")
-                post_html = run_ai(p_c, provider, ai_key, ai_model, 0.6, sys_c,
-                                   enable_fallback, fallback_keys).replace("```html","").replace("```","").strip()
+                manual_cat = int(cat_id.strip()) if (not auto_category and cat_id.strip().isdigit()) else None
+                tids = [int(t.strip()) for t in tag_ids.split(",") if t.strip().isdigit()] if tag_ids.strip() else None
 
-                meta_desc, focus_kw, exc_text = "", "", ""
-                if create_seo:
-                    with col1: st.info("🔍 Generating SEO meta...")
-                    plain = BeautifulSoup(post_html,"html.parser").get_text()
-                    seo   = generate_seo_meta(topic, plain, provider, ai_key, ai_model,
-                                              enable_fallback, fallback_keys)
-                    meta_desc = seo.get("meta_description","")
-                    focus_kw  = seo.get("focus_keyword","")
-                    exc_text  = seo.get("excerpt","")
+                result = build_and_publish_post(
+                    topic, domain, auth, language=fix_lang, tone=fix_tone, word_count=fix_words,
+                    wp_status=wp_status, date_iso=date_iso, do_image=create_img, do_seo=create_seo,
+                    do_schema=create_schema, auto_category=auto_category, manual_category_id=manual_cat,
+                    tag_ids=tids, is_dry_run=create_dry, progress_cb=lambda msg: col1.info(msg))
 
-                if create_schema:
-                    tag = ('<script type="application/ld+json">'
-                           + generate_schema_jsonld(topic, f"https://{domain}/",
-                                                    (date_iso or datetime.utcnow().isoformat()),
-                                                    meta_desc or exc_text)
-                           + '</script>')
-                    post_html = tag + "\n" + post_html
-
-                media_id, img_bytes, seo_alt = None, None, ""
-                if create_img:
-                    with col1: st.info("🎨 Generating featured image...")
-                    raw = run_ai(f"2-sentence photorealistic image prompt for '{topic}'. Raw text only.",
-                                 provider, ai_key, ai_model, 0.1,
-                                 enable_fallback=enable_fallback, fallback_keys=fallback_keys)
-                    ipr = " ".join(raw.replace("*","").replace('"','').split())[:800]
-                    seo_alt = run_ai(f"SEO image alt text under 120 chars for '{topic}'. No quotes.",
-                                     provider, ai_key, ai_model, 0.1,
-                                     enable_fallback=enable_fallback, fallback_keys=fallback_keys).replace('"','')
-                    for attempt in range(3):
-                        try:
-                            _use_dalle = image_provider == "DALL-E 3" and bool(dalle_key or ai_key)
-                            img_bytes = gen_image_dalle(ipr, dalle_key or ai_key, dalle_style) if _use_dalle else gen_image_pollinations(ipr)
-                            with col2: st.image(img_bytes, caption=seo_alt)
-                            break
-                        except Exception as ie:
-                            if attempt == 2:
-                                with col1: st.warning(f"Image failed: {ie}")
-                            else: time.sleep(3)
+                if result.get("category_name"):
+                    col1.caption(f"🏷️ AI chose: **{result['category_name']}** (id {result['category_id']})")
+                if result.get("image_bytes"):
+                    col2.image(result["image_bytes"], caption=result.get("image_alt", ""))
+                elif create_img and result.get("error"):
+                    col1.warning(result["error"])
 
                 if create_dry:
                     with col1:
@@ -3282,68 +3620,32 @@ elif active == "create":
                         label = f"🕐 Would schedule: {sched_label}" if wp_status == "future" else "🟡 Preview only"
                         st.markdown(f'<span class="run-badge {badge}">{label}</span>', unsafe_allow_html=True)
                         with st.expander("View generated content & schedule"):
-                            if meta_desc: st.write(f"**Meta:** {meta_desc}")
-                            if focus_kw:  st.write(f"**KW:** {focus_kw}")
-                            if exc_text:  st.write(f"**Excerpt:** {exc_text}")
+                            if result["meta_desc"]: st.write(f"**Meta:** {result['meta_desc']}")
+                            if result["focus_kw"]:  st.write(f"**KW:** {result['focus_kw']}")
+                            if result["excerpt"]:   st.write(f"**Excerpt:** {result['excerpt']}")
                             st.write(f"**WP Status:** `{wp_status}`")
                             if date_iso:  st.write(f"**Scheduled date:** `{date_iso}` UTC")
-                            st.code(post_html[:1500]+"... (truncated)", language="html")
+                            st.code(result["content_html"][:1500]+"... (truncated)", language="html")
+                    created_ok.append(topic)
+
+                elif result["ok"]:
+                    with col1:
+                        if wp_status == "future":
+                            st.markdown(f'<span class="run-badge sched">🕐 Scheduled: {sched_label}</span>',
+                                        unsafe_allow_html=True)
+                        else:
+                            st.markdown('<span class="run-badge ok">✅ Published</span>', unsafe_allow_html=True)
+                        st.caption(f"Post #{result['post_id']} · {result['link']}")
+                    st.session_state.created_log.append({
+                        "topic": topic, "id": result["post_id"], "link": result["link"],
+                        "scheduled": date_iso if wp_status == "future" else ""
+                    })
                     created_ok.append(topic)
 
                 else:
-                    if img_bytes:
-                        try: media_id = upload_wp_image(img_bytes, topic, seo_alt, auth, domain, optimize_seo_img)
-                        except Exception as ue:
-                            with col1: st.warning(f"Upload failed: {ue}")
-
-                    pl = {"title": topic, "content": post_html,
-                          "status": wp_status, "excerpt": exc_text}
-                    if media_id:  pl["featured_media"] = media_id
-                    if date_iso:  pl["date"] = date_iso
-
-                    resolved_cat = None
-                    if auto_category:
-                        wp_cats = fetch_wp_categories(auth, domain)
-                        if wp_cats:
-                            plain_txt = BeautifulSoup(post_html,"html.parser").get_text()
-                            resolved_cat = ai_pick_category(
-                                topic, plain_txt, wp_cats,
-                                provider, ai_key, ai_model,
-                                enable_fallback, fallback_keys
-                            )
-                            if resolved_cat:
-                                cat_name = next((n for n,cid in wp_cats.items() if cid==resolved_cat), "?")
-                                with col1: st.caption(f"🏷️ AI chose: **{cat_name}** (id {resolved_cat})")
-                    elif cat_id.strip().isdigit():
-                        resolved_cat = int(cat_id.strip())
-                    if resolved_cat: pl["categories"] = [resolved_cat]
-                    if tag_ids.strip():
-                        tids = [int(t.strip()) for t in tag_ids.split(",") if t.strip().isdigit()]
-                        if tids: pl["tags"] = tids
-
-                    r = wp_create_post(pl, auth, domain)
-                    if r and r.status_code == 201:
-                        new_id   = r.json().get("id")
-                        new_link = r.json().get("link","")
-                        with col1:
-                            if wp_status == "future":
-                                st.markdown(f'<span class="run-badge sched">🕐 Scheduled: {sched_label}</span>',
-                                            unsafe_allow_html=True)
-                            else:
-                                st.markdown(f'<span class="run-badge ok">✅ Published</span>', unsafe_allow_html=True)
-                            st.caption(f"Post #{new_id} · {new_link}")
-                        if create_seo and meta_desc:
-                            update_yoast_meta(new_id, meta_desc, focus_kw, auth, domain)
-                        st.session_state.created_log.append({
-                            "topic": topic, "id": new_id, "link": new_link,
-                            "scheduled": date_iso if wp_status == "future" else ""
-                        })
-                        created_ok.append(topic)
-                    else:
-                        code = r.status_code if r else "no response"
-                        with col1:
-                            st.markdown(f'<span class="run-badge err">❌ HTTP {code}</span>', unsafe_allow_html=True)
-                        created_err.append(topic)
+                    with col1:
+                        st.markdown(f'<span class="run-badge err">❌ {result["error"]}</span>', unsafe_allow_html=True)
+                    created_err.append(topic)
 
             except Exception as e:
                 with col1: st.error(f"Error: {e}")

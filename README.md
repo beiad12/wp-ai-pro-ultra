@@ -76,6 +76,8 @@ Each check below is its own sub-tab with its own "Run" button, plus one "Run ful
 ### 🤖 The Agent tab
 Replaces the old static dashboard. On load: a typing indicator, then a time-of-day + name-based greeting, then an offer to run today's check. Say yes and it runs the full audit and summarizes the results in plain language with an action-chip menu (load posts, fix missing images, fix thin/stale content, improve SEO meta, speed up the site, harden security, create posts, get a PDF report, re-run the check). Every action reuses the exact same functions as their dedicated tabs — nothing duplicated — and respects Sandbox mode identically.
 
+**Free-text tool-calling** — below the menu, type a request in your own words (e.g. "optimize my thin posts and generate images for anything missing one"). Your connected LLM plans a short sequence of steps drawn *only* from a fixed, whitelisted tool registry (load posts, fix images, rewrite thin/stale content, fix SEO meta, fix image dimensions, install caching/security plugins, generate a PDF report, create one post). The model never writes or executes code — it only proposes `{tool, args}` steps, which are validated against the registry and shown to you as a checklist before anything runs. Uncheck any step you don't want, then confirm. Plugin installs stay blocked while Sandbox is on, same as everywhere else in the app.
+
 ---
 
 ## 🔑 Tips
