@@ -8,6 +8,10 @@ Runs 100% on your own PC at `http://localhost:8501`. No Colab, no ngrok, no clou
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.35%2B-red?logo=streamlit)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
+## 📱 Also available: Bemo21 for Android
+
+A standalone native Android app lives in [`android/`](android/) — it does not depend on this desktop app or your PC at all. Install it on your phone, connect your WordPress site and AI provider directly from the onboarding flow, and manage your site from a chat-driven assistant. See [`android/README.md`](android/README.md) for build/install instructions.
+
 ---
 
 ## 🚀 Installation
