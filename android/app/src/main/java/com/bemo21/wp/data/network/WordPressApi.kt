@@ -1,6 +1,5 @@
 package com.bemo21.wp.data.network
 
-import android.util.Base64
 import com.bemo21.wp.data.BemoCredentials
 import com.bemo21.wp.data.WpPost
 import kotlinx.coroutines.Dispatchers
@@ -12,6 +11,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 class WordPressException(message: String) : Exception(message)
@@ -52,33 +52,27 @@ class WordPressApi(private val creds: BemoCredentials) {
         }
     }
 
-    suspend fun fetchPosts(status: String = "publish", perPage: Int = 30): Result<List<WpPost>> =
-        withContext(Dispatchers.IO) {
-            try {
-                val url = "${creds.siteUrl}/wp-json/wp/v2/posts?status=$status&per_page=$perPage&_fields=id,title,excerpt,status,link,featured_media,content"
-                val req = Request.Builder().url(url).header("Authorization", authHeader).get().build()
-                client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) return@withContext Result.failure(WordPressException(friendlyHttpError(resp.code)))
-                    val arr = JSONArray(resp.body?.string() ?: "[]")
-                    val posts = (0 until arr.length()).map { i ->
-                        val o = arr.getJSONObject(i)
-                        val content = o.optJSONObject("content")?.optString("rendered", "") ?: ""
-                        WpPost(
-                            id = o.getInt("id"),
-                            title = htmlDecode(o.optJSONObject("title")?.optString("rendered", "") ?: ""),
-                            excerpt = htmlDecode(stripTags(o.optJSONObject("excerpt")?.optString("rendered", "") ?: "")),
-                            status = o.optString("status", "publish"),
-                            link = o.optString("link", ""),
-                            hasFeaturedImage = o.optInt("featured_media", 0) != 0,
-                            wordCount = stripTags(content).trim().split(Regex("\\s+")).filter { it.isNotBlank() }.size
-                        )
-                    }
-                    Result.success(posts)
-                }
-            } catch (e: Exception) {
-                Result.failure(WordPressException(friendlyNetworkError(e)))
+    suspend fun fetchPosts(
+        status: String = "publish",
+        perPage: Int = 30,
+        search: String? = null
+    ): Result<List<WpPost>> = withContext(Dispatchers.IO) {
+        try {
+            var url = "${creds.siteUrl}/wp-json/wp/v2/posts?status=$status&per_page=$perPage" +
+                "&_fields=id,title,excerpt,status,link,featured_media,content,modified"
+            if (!search.isNullOrBlank()) {
+                url += "&search=" + URLEncoder.encode(search, "UTF-8")
             }
+            val req = Request.Builder().url(url).header("Authorization", authHeader).get().build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext Result.failure(WordPressException(friendlyHttpError(resp.code)))
+                val arr = JSONArray(resp.body?.string() ?: "[]")
+                Result.success((0 until arr.length()).map { i -> parsePost(arr.getJSONObject(i)) })
+            }
+        } catch (e: Exception) {
+            Result.failure(WordPressException(friendlyNetworkError(e)))
         }
+    }
 
     suspend fun createPost(
         title: String,
@@ -101,27 +95,17 @@ class WordPressApi(private val creds: BemoCredentials) {
             client.newCall(req).execute().use { resp ->
                 val bodyStr = resp.body?.string() ?: "{}"
                 if (!resp.isSuccessful) return@withContext Result.failure(WordPressException(friendlyHttpError(resp.code)))
-                val o = JSONObject(bodyStr)
-                Result.success(
-                    WpPost(
-                        id = o.getInt("id"),
-                        title = htmlDecode(o.optJSONObject("title")?.optString("rendered", title) ?: title),
-                        excerpt = excerpt,
-                        status = o.optString("status", status),
-                        link = o.optString("link", ""),
-                        hasFeaturedImage = false,
-                        wordCount = stripTags(contentHtml).trim().split(Regex("\\s+")).size
-                    )
-                )
+                Result.success(parsePost(JSONObject(bodyStr)))
             }
         } catch (e: Exception) {
             Result.failure(WordPressException(friendlyNetworkError(e)))
         }
     }
 
-    suspend fun updatePostExcerpt(postId: Int, excerpt: String): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun updatePost(postId: Int, fields: Map<String, Any>): Result<Unit> = withContext(Dispatchers.IO) {
         try {
-            val payload = JSONObject().put("excerpt", excerpt)
+            val payload = JSONObject()
+            fields.forEach { (k, v) -> payload.put(k, v) }
             val req = Request.Builder()
                 .url("${creds.siteUrl}/wp-json/wp/v2/posts/$postId")
                 .header("Authorization", authHeader)
@@ -134,6 +118,49 @@ class WordPressApi(private val creds: BemoCredentials) {
         } catch (e: Exception) {
             Result.failure(WordPressException(friendlyNetworkError(e)))
         }
+    }
+
+    suspend fun uploadMedia(bytes: ByteArray, filename: String, altText: String): Result<Int> = withContext(Dispatchers.IO) {
+        try {
+            val mediaType = "image/jpeg".toMediaType()
+            val req = Request.Builder()
+                .url("${creds.siteUrl}/wp-json/wp/v2/media")
+                .header("Authorization", authHeader)
+                .header("Content-Disposition", "attachment; filename=\"$filename\"")
+                .post(bytes.toRequestBody(mediaType))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val bodyStr = resp.body?.string() ?: "{}"
+                if (!resp.isSuccessful) return@withContext Result.failure(WordPressException(friendlyHttpError(resp.code)))
+                val mediaId = JSONObject(bodyStr).getInt("id")
+                if (altText.isNotBlank()) {
+                    val altReq = Request.Builder()
+                        .url("${creds.siteUrl}/wp-json/wp/v2/media/$mediaId")
+                        .header("Authorization", authHeader)
+                        .post(JSONObject().put("alt_text", altText).toString().toRequestBody(jsonMedia))
+                        .build()
+                    client.newCall(altReq).execute().close()
+                }
+                Result.success(mediaId)
+            }
+        } catch (e: Exception) {
+            Result.failure(WordPressException(friendlyNetworkError(e)))
+        }
+    }
+
+    private fun parsePost(o: JSONObject): WpPost {
+        val content = o.optJSONObject("content")?.optString("rendered", "") ?: ""
+        return WpPost(
+            id = o.getInt("id"),
+            title = htmlDecode(o.optJSONObject("title")?.optString("rendered", "") ?: ""),
+            excerpt = htmlDecode(stripTags(o.optJSONObject("excerpt")?.optString("rendered", "") ?: "")),
+            contentHtml = content,
+            status = o.optString("status", "publish"),
+            link = o.optString("link", ""),
+            featuredMediaId = o.optInt("featured_media", 0),
+            wordCount = stripTags(content).trim().split(Regex("\\s+")).filter { it.isNotBlank() }.size,
+            modified = o.optString("modified", "")
+        )
     }
 
     private fun friendlyHttpError(code: Int): String = when (code) {

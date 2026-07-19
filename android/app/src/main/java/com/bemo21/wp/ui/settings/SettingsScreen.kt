@@ -53,6 +53,9 @@ fun SettingsScreen(
         contentPadding = PaddingValues(bottom = 32.dp)
     ) {
         item {
+            Text("Settings", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(bottom = 4.dp))
+        }
+        item {
             SectionHeader("WordPress site")
             OutlinedTextField(domain, { domain = it }, label = { Text("Domain") }, modifier = Modifier.fillMaxWidth())
             OutlinedTextField(wpUser, { wpUser = it }, label = { Text("Username") }, modifier = Modifier.fillMaxWidth())

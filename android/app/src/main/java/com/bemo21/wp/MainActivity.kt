@@ -32,8 +32,10 @@ class MainActivity : ComponentActivity() {
                         Screen.ONBOARDING -> OnboardingScreen(onComplete = { appState.completeOnboarding(it) })
                         else -> MainScreen(
                             screen = appState.screen,
+                            overlay = appState.overlay,
                             creds = appState.credentials,
-                            onScreenChange = { appState.screen = it },
+                            onScreenChange = { appState.screen = it; appState.overlay = null },
+                            onOpenOverlay = { appState.overlay = it },
                             onSaveSettings = { appState.update(it) },
                             onDisconnect = { appState.resetAll() }
                         )

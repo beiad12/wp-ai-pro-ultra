@@ -32,24 +32,22 @@ data class WpPost(
     val id: Int,
     val title: String,
     val excerpt: String,
+    val contentHtml: String,
     val status: String,
     val link: String,
-    val hasFeaturedImage: Boolean,
-    val wordCount: Int
+    val featuredMediaId: Int,
+    val wordCount: Int,
+    val modified: String
+) {
+    val hasFeaturedImage: Boolean get() = featuredMediaId != 0
+    val isThin: Boolean get() = wordCount < 200
+}
+
+enum class CheckStatus { PASS, WARN, FAIL }
+
+data class HealthCheck(
+    val id: String,
+    val label: String,
+    val status: CheckStatus,
+    val detail: String
 )
-
-enum class ChatRole { USER, ASSISTANT }
-
-data class ChatMessage(
-    val role: ChatRole,
-    val text: String,
-    val plan: List<AgentStep>? = null
-)
-
-data class AgentStep(
-    val tool: String,
-    val args: Map<String, String>,
-    val why: String
-)
-
-data class ToolResult(val ok: Boolean, val message: String)

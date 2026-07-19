@@ -153,7 +153,7 @@ fun OnboardingScreen(onComplete: (BemoCredentials) -> Unit) {
                     Icon(Icons.Filled.CheckCircle, contentDescription = null, tint = BemoTeal, modifier = Modifier.size(48.dp))
                     Text("You're all set!", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(top = 8.dp))
                     Text(
-                        "Bemo21 is connected to $domain. Head to the dashboard to run your first check, or open Chat to just tell me what you need.",
+                        "Bemo21 is connected to $domain. Check your dashboard for a live overview, or head to Tools for site health, SEO, and content actions.",
                         style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(top = 8.dp)
                     )
                 }

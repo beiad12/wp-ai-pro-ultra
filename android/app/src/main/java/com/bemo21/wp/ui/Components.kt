@@ -7,18 +7,29 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import com.bemo21.wp.data.CheckStatus
+import com.bemo21.wp.ui.theme.BemoAmber
 import com.bemo21.wp.ui.theme.BemoCoral
 import com.bemo21.wp.ui.theme.BemoPurple
 import com.bemo21.wp.ui.theme.BemoPurpleDark
@@ -65,7 +76,7 @@ fun GradientHero(title: String, subtitle: String, statusLine: String? = null) {
 fun StatusPill(label: String, tone: PillTone = PillTone.NEUTRAL) {
     val color = when (tone) {
         PillTone.SUCCESS -> BemoTeal
-        PillTone.WARN -> Color(0xFFD9A441)
+        PillTone.WARN -> BemoAmber
         PillTone.FAIL -> BemoCoral
         PillTone.NEUTRAL -> MaterialTheme.colorScheme.onSurfaceVariant
     }
@@ -127,3 +138,52 @@ fun EmptyState(icon: String, message: String) {
 val CardSpacing = 12.dp
 val ScreenPadding = 16.dp
 val CardArrangement = Arrangement.spacedBy(CardSpacing)
+
+fun CheckStatus.toPillTone(): PillTone = when (this) {
+    CheckStatus.PASS -> PillTone.SUCCESS
+    CheckStatus.WARN -> PillTone.WARN
+    CheckStatus.FAIL -> PillTone.FAIL
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ToolTopBar(title: String, onBack: () -> Unit) {
+    TopAppBar(
+        title = { Text(title) },
+        navigationIcon = {
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+            }
+        },
+        colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)
+    )
+}
+
+@Composable
+fun ToolCard(icon: String, title: String, subtitle: String, onClick: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier.background(BemoPurple.copy(alpha = 0.16f), RoundedCornerShape(12.dp)).padding(10.dp)
+            ) {
+                Text(icon, style = MaterialTheme.typography.titleLarge)
+            }
+            Column(Modifier.padding(start = 14.dp).weight(1f)) {
+                Text(title, style = MaterialTheme.typography.titleMedium)
+                Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+}
+
+@Composable
+fun LoadingBlock(message: String) {
+    Column(Modifier.fillMaxWidth().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        CircularProgressIndicator()
+        Text(message, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 12.dp))
+    }
+}

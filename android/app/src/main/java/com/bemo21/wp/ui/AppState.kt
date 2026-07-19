@@ -7,9 +7,18 @@ import androidx.compose.runtime.setValue
 import com.bemo21.wp.data.BemoCredentials
 import com.bemo21.wp.data.store.CredentialStore
 
-enum class Screen { ONBOARDING, DASHBOARD, CHAT, SETTINGS }
+enum class Screen { ONBOARDING, DASHBOARD, POSTS, TOOLS, SETTINGS }
 
-/** Holds the single source of truth for credentials + current screen, backed by encrypted local storage. */
+/** Full-screen tool overlays, pushed on top of the bottom-nav screens with their own back button. */
+sealed class Overlay {
+    data object CreatePost : Overlay()
+    data object SeoBatch : Overlay()
+    data object FixImages : Overlay()
+    data object SiteHealth : Overlay()
+    data class PostDetail(val postId: Int) : Overlay()
+}
+
+/** Holds the single source of truth for credentials + navigation, backed by encrypted local storage. */
 class AppState(context: Context) {
     private val store = CredentialStore(context.applicationContext)
 
@@ -17,6 +26,7 @@ class AppState(context: Context) {
         private set
 
     var screen by mutableStateOf(if (store.hasOnboarded()) Screen.DASHBOARD else Screen.ONBOARDING)
+    var overlay by mutableStateOf<Overlay?>(null)
 
     fun update(creds: BemoCredentials) {
         credentials = creds
@@ -31,6 +41,7 @@ class AppState(context: Context) {
     fun resetAll() {
         store.clear()
         credentials = BemoCredentials()
+        overlay = null
         screen = Screen.ONBOARDING
     }
 }

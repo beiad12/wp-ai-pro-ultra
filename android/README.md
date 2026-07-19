@@ -5,11 +5,22 @@ A standalone native Android app. It does **not** talk to your PC or the Streamli
 ## What it is
 
 - **Onboarding**: connect your WordPress site (domain, username, Application Password) and your AI provider (Claude / OpenAI / Mistral / Gemini + API key). Both are tested live before you can continue.
-- **Dashboard**: a gradient hero card, connection status, post stats (published count, missing images, thin content), and recent posts — all fetched live from your site.
-- **Chat**: type what you want in plain language ("write a post about home coffee brewing", "list my recent posts", "fix my missing meta descriptions"). Bemo21's connected AI plans a short list of steps from a fixed, whitelisted tool set (`list_posts`, `create_post`, `fix_seo_meta`) and shows them to you as a checklist — nothing runs until you tap **Run selected**. Sandbox mode (on by default) previews instead of writing.
+- **Dashboard**: a gradient hero card, live post stats (published count, missing images, thin content, missing meta), a one-tap site health check, and recent posts — all fetched live from your site. Tapping a post opens it directly.
+- **Posts**: search and filter your posts (published/draft/private), each with at-a-glance badges for missing image / thin content / missing meta. Tap through to a post for per-post actions.
+- **Tools** — dedicated, real screens instead of a chat detour:
+  - ✨ **Create post** — a form (topic, target length, publish-now vs. draft), writes real HTML via your AI provider and an SEO meta description, then publishes through the WordPress REST API.
+  - 🔍 **SEO batch fix** — scans every published post for a missing meta description and fixes them one by one with a live progress list.
+  - 🖼️ **Fix missing images** — generates a featured image (free, keyless Pollinations) for every post missing one, uploads it to your media library, and attaches it.
+  - 🩺 **Site health check** — SSL certificate validity, response time, page weight, compression, title/meta tag length, mobile viewport tag, H1 usage, homepage image alt text, robots.txt and sitemap.xml — checked live against your homepage, no WP-admin login required.
 - **Settings**: edit credentials, toggle Sandbox mode, toggle background site-health sync, disconnect & reset.
 
 All credentials are stored **only on the device**, encrypted at rest via AndroidX Security (`EncryptedSharedPreferences`, AES-256-GCM, backed by the Android Keystore). Nothing syncs to any cloud service Bemo21 controls — there isn't one.
+
+## Design notes
+
+- One navigation surface (bottom nav: Dashboard / Posts / Tools / Settings) — no shortcut buttons that duplicate a tab that's already one tap away. Tool screens open as full-screen overlays with a single back button.
+- Every status (missing image, thin content, pass/warn/fail) is a colored pill, not a wall of text.
+- Sandbox mode (on by default) previews every write across every tool identically — post creation, SEO fixes, image fixes — nothing goes live until you turn it off in Settings.
 
 ## Being honest about "runs in the background after reboot"
 
@@ -43,11 +54,12 @@ Or just open the `android/` folder in Android Studio, hit **Run**, and pick your
 android/
 ├── app/src/main/java/com/bemo21/wp/
 │   ├── MainActivity.kt
-│   ├── data/                  ← models, WordPress REST client, AI client, whitelisted tool registry
+│   ├── data/                  ← models, WordPress REST client, AI client, image generator, site health checker
 │   ├── ui/
 │   │   ├── onboarding/        ← WordPress + AI connection flow
-│   │   ├── dashboard/         ← stats & recent posts
-│   │   ├── chat/              ← the conversational assistant
+│   │   ├── dashboard/         ← live stats & recent posts
+│   │   ├── posts/             ← post list/search + per-post detail & actions
+│   │   ├── tools/             ← Create post, SEO batch fix, Fix images, Site health
 │   │   ├── settings/
 │   │   └── theme/             ← Bemo21's Material3 theme (purple/indigo, matches the desktop app)
 │   └── work/SiteSyncWorker.kt ← periodic background health check (WorkManager)
@@ -56,4 +68,4 @@ android/
 
 ## What's real vs. what's next
 
-Every action in Chat is a genuine network call — post creation, listing, and SEO meta writes go through the actual WordPress REST API, and content generation calls your actual AI provider. Nothing is faked. What's scoped out of this first version (and honestly so, not silently skipped): featured-image generation/upload, the full Site Health audit suite (technical/security/performance/SEO crawl), and PDF reporting — all of which exist in the desktop app and are natural next additions here once this core flow is confirmed working well on a real device.
+Every tool action is a genuine network call — post creation, listing, SEO meta writes, image generation/upload, and site health checks all go through the actual WordPress REST API and your actual AI provider. Nothing is faked. Scoped out of this pass, on purpose: the full crawl-based SEO audit, security header/plugin checks, and PDF reporting from the desktop app — natural next additions once this core toolset is confirmed working well on a real device.
