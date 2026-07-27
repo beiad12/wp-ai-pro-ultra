@@ -2016,7 +2016,8 @@ for k, v in [("posts",[]),("selected",[]),("active_tab","dashboard"),
              ("design_media_page",1),("design_media_cache",None),
              ("design_palette_preview",None),("design_theme_info",None),
              ("design_global_styles",None),("design_wp_settings",None),
-             ("design_patterns",None),("design_ticker_state",{})]:
+             ("design_patterns",None),("design_ticker_state",{}),
+             ("design_cmd_image",None),("design_cmd_log",[]),("design_cmd_plan",[])]:
     if k not in st.session_state: st.session_state[k] = v
 
 # ════════════════════════════════════════════════════════════
@@ -2057,12 +2058,33 @@ AGENT_TOOLS = {
                 "publish (bool, default false — false publishes as a draft for review)."},
 }
 
-def run_agent_planner(user_request, context_summary):
+# A separate, deliberately narrow registry for the Theme & Design tab's own
+# command box — it should only ever touch branding/identity/color, never
+# posts, SEO, security, or caching. Passed to run_agent_planner instead of
+# AGENT_TOOLS so the model can't select anything outside this scope.
+DESIGN_TOOLS = {
+    "set_site_title_tagline": {
+        "desc": "Update the site title and/or tagline. Args: title (optional string), tagline (optional string)."},
+    "set_site_logo": {
+        "desc": "Set the site logo — uses the attached image if one was uploaded, otherwise generates one from "
+                "a text description. Args: prompt (string describing the logo, only used if no image is attached)."},
+    "set_site_icon": {
+        "desc": "Set the site icon/favicon, auto-cropped to a 512x512 square — uses the attached image if one was "
+                "uploaded, otherwise generates one from a text description. Args: prompt (string, only used if no "
+                "image is attached)."},
+    "apply_color_palette": {
+        "desc": "Apply a color palette to the site's design. Args: preset (one of: " + ", ".join(PALETTE_PRESETS) +
+                "), OR primary/secondary/accent/text (hex color strings, for a custom palette not matching a preset)."},
+}
+
+def run_agent_planner(user_request, context_summary, tools=None):
     """Asks the connected LLM to turn a free-text request into a short plan of
-    steps drawn ONLY from AGENT_TOOLS. Returns {"reply": str, "steps": [...]}.
-    Any tool name the model invents that isn't in the registry is dropped —
-    the model proposes, it never executes."""
-    tools_desc = "\n".join(f"- {name}: {meta['desc']}" for name, meta in AGENT_TOOLS.items())
+    steps drawn ONLY from the given tool registry (AGENT_TOOLS by default).
+    Returns {"reply": str, "steps": [...]}. Any tool name the model invents
+    that isn't in the registry is dropped — the model proposes, it never
+    executes."""
+    tools = tools or AGENT_TOOLS
+    tools_desc = "\n".join(f"- {name}: {meta['desc']}" for name, meta in tools.items())
     system = (
         "You are the planning brain for a WordPress agency assistant. You never write or run code yourself — "
         "you only choose from this fixed list of whitelisted tools and respond with strict JSON, nothing else, "
@@ -2085,20 +2107,23 @@ def run_agent_planner(user_request, context_summary):
     try:
         data = json.loads(raw)
     except Exception:
-        return {"reply": "I couldn't build a clear plan from that — try rephrasing, or use the menu above.", "steps": []}
+        return {"reply": "I couldn't build a clear plan from that — try rephrasing.", "steps": []}
 
     clean_steps = []
     for step in (data.get("steps") or [])[:5]:
         tool = step.get("tool")
-        if tool not in AGENT_TOOLS:
+        if tool not in tools:
             continue
         args = step.get("args") if isinstance(step.get("args"), dict) else {}
         clean_steps.append({"tool": tool, "args": args, "why": step.get("why", "")})
     return {"reply": data.get("reply") or "Here's what I'd do:", "steps": clean_steps}
 
-def execute_agent_tool(tool, args, auth, domain, is_dry_run):
+def execute_agent_tool(tool, args, auth, domain, is_dry_run, uploaded_image=None):
     """Runs one whitelisted agent tool call for real, through the exact same
-    wrapper functions as the dedicated tabs. Returns (ok: bool, message: str)."""
+    wrapper functions as the dedicated tabs. Returns (ok: bool, message: str).
+    uploaded_image is the raw bytes of a file the user attached to their
+    free-text request, if any — only the *_image / *_logo / *_icon tools
+    below consume it."""
     args = args or {}
 
     if tool == "load_posts":
@@ -2224,6 +2249,78 @@ def execute_agent_tool(tool, args, auth, domain, is_dry_run):
         if r["ok"]:
             return True, f"Created post #{r['post_id']} — {r['link']} ✅"
         return False, f"Couldn't create the post: {r['error']}"
+
+    if tool == "set_site_title_tagline":
+        title, tagline = args.get("title"), args.get("tagline")
+        if not title and not tagline:
+            return False, "Tell me the new site title and/or tagline."
+        fields = {}
+        if title: fields["title"] = title
+        if tagline: fields["description"] = tagline
+        if is_dry_run:
+            return True, f"🟡 Sandbox preview — would set {fields}."
+        ok, msg = update_wp_settings(fields, auth, domain)
+        return ok, (f"Updated {fields}. ✅" if ok else msg)
+
+    if tool in ("set_site_logo", "set_site_icon"):
+        img_bytes = uploaded_image
+        if img_bytes is None:
+            prompt_text = (args.get("prompt") or "").strip()
+            if not prompt_text:
+                return False, "No image was attached and no description was given — attach an image or describe what you want."
+            if not ai_key:
+                return False, "I need an AI API key in the sidebar to generate an image."
+            try:
+                _use_dalle = image_provider == "DALL-E 3" and bool(dalle_key or ai_key)
+                img_bytes = gen_image_dalle(prompt_text, dalle_key or ai_key, dalle_style) if _use_dalle else gen_image_pollinations(prompt_text)
+            except Exception as e:
+                return False, f"Image generation failed: {friendly_error(e)}"
+
+        if tool == "set_site_icon":
+            if is_dry_run:
+                return True, "🟡 Sandbox preview — would crop this image to 512×512 and set it as your site icon."
+            try:
+                square = crop_square(img_bytes, 512)
+                media_id = upload_wp_image(square, "Site Icon", "Site icon", auth, domain, True)
+            except Exception as e:
+                return False, str(e) if isinstance(e, ModuleNotFoundError) else f"Upload failed: {friendly_error(e)}"
+            ok, msg = update_wp_settings({"site_icon": media_id}, auth, domain)
+            return ok, (f"Site icon set (media ID {media_id}). ✅" if ok else msg)
+
+        if is_dry_run:
+            return True, "🟡 Sandbox preview — would upload this image and use it as your site logo."
+        try:
+            media_id = upload_wp_image(img_bytes, "Site Logo", "Site logo", auth, domain, True)
+        except Exception as e:
+            return False, f"Upload failed: {friendly_error(e)}"
+        return True, (
+            f"Uploaded (media ID {media_id}). WordPress doesn't expose the site logo through the core REST API "
+            f"the way it does the site icon, so finish it in one click: **Appearance → Editor → Styles → Site "
+            f"Identity** and pick the image you just uploaded."
+        )
+
+    if tool == "apply_color_palette":
+        preset = (args.get("preset") or "").strip()
+        if preset in PALETTE_PRESETS:
+            palette = PALETTE_PRESETS[preset]
+        else:
+            required = ("primary", "secondary", "accent", "text")
+            if all(args.get(k) for k in required):
+                palette = {k: args[k] for k in required}
+            else:
+                return False, f"Tell me a preset name ({', '.join(PALETTE_PRESETS)}) or all four hex colors (primary/secondary/accent/text)."
+        if is_dry_run:
+            return True, f"🟡 Sandbox preview — would apply this palette to your site's Global Styles: {palette}"
+        theme_info, terr = fetch_active_theme_info(auth, domain)
+        snippet = build_style_variation_snippet(palette)
+        if not theme_info:
+            return False, (f"Couldn't detect your active theme ({terr}). Here's a copy-paste snippet instead:\n"
+                           f"```json\n{snippet}\n```\nSave it as `style-variation.json` in your theme's /styles/ folder.")
+        ok, msg = apply_global_styles_colors(palette, auth, domain, theme_info)
+        if not ok:
+            return False, (f"{msg} Here's a copy-paste snippet instead:\n```json\n{snippet}\n```\n"
+                           f"Save it as `style-variation.json` in your theme's /styles/ folder.")
+        return True, msg
 
     return False, f"Unknown tool: {tool}"
 
@@ -4090,9 +4187,95 @@ elif active == "design":
         if dry_run:
             st.info("🟡 Sandbox mode is ON — every change below previews only; nothing writes to WordPress until you turn Sandbox off in the sidebar.")
 
-        id_tab, color_tab, media_tab, layout_tab = st.tabs(
-            ["🏷️ Site Identity", "🎨 Color & Typography", "🖼️ Media Library", "📰 Homepage Layout"]
+        cmd_tab, id_tab, color_tab, media_tab, layout_tab = st.tabs(
+            ["🪄 AI Command", "🏷️ Site Identity", "🎨 Color & Typography", "🖼️ Media Library", "📰 Homepage Layout"]
         )
+
+        # ════════════════════════════════════════════════════
+        # 0. AI COMMAND — one prompt (+ optional image) fixes it
+        # ════════════════════════════════════════════════════
+        with cmd_tab:
+            st.markdown(
+                "<div class='hint' style='padding-bottom:10px'>Describe what you want changed — site title/tagline, "
+                "logo, favicon, or color palette — attach an image if you have one, and I'll plan the exact steps "
+                "before touching your site.</div>", unsafe_allow_html=True
+            )
+
+            cmd_upload = st.file_uploader("Attach an image (optional)", type=["png", "jpg", "jpeg", "webp"], key="design_cmd_uploader")
+            if cmd_upload is not None:
+                st.session_state.design_cmd_image = cmd_upload.read()
+            if st.session_state.design_cmd_image:
+                ic1, ic2 = st.columns([1, 4])
+                with ic1:
+                    st.image(st.session_state.design_cmd_image, width=100)
+                with ic2:
+                    st.caption("Attached — will be used by logo/favicon actions instead of AI-generating one.")
+                    if st.button("✖ Remove image", key="design_cmd_remove_img"):
+                        st.session_state.design_cmd_image = None
+                        st.rerun()
+
+            for msg in st.session_state.design_cmd_log:
+                with st.chat_message("assistant" if msg["role"] == "assistant" else "user"):
+                    st.markdown(msg["text"])
+
+            dc1, dc2 = st.columns([5, 1])
+            with dc1:
+                design_prompt = st.text_input(
+                    "Command", key="design_cmd_text", label_visibility="collapsed",
+                    placeholder="e.g. Set my site title to 'Bloom & Co' and use this image as the logo"
+                )
+            with dc2:
+                design_plan_clicked = st.button("Plan it →", key="design_cmd_plan_btn", use_container_width=True,
+                                                disabled=not (design_prompt.strip() and ai_key))
+            if not ai_key:
+                st.caption("Add an AI API key in the sidebar to use this.")
+
+            if design_plan_clicked and design_prompt.strip():
+                st.session_state.design_cmd_log.append({"role": "user", "text": design_prompt.strip()})
+                context_summary = (
+                    f"connected to {domain}, sandbox={'on' if dry_run else 'off'}, "
+                    f"{'an image is attached' if st.session_state.design_cmd_image else 'no image is attached'}."
+                )
+                with st.spinner("Planning..."):
+                    plan = run_agent_planner(design_prompt.strip(), context_summary, tools=DESIGN_TOOLS)
+                st.session_state.design_cmd_plan = plan["steps"]
+                st.session_state.design_cmd_log.append({"role": "assistant", "text": plan["reply"]})
+                st.rerun()
+
+            if st.session_state.design_cmd_plan:
+                st.markdown("<div class='panel-box' style='margin-top:10px'>", unsafe_allow_html=True)
+                st.markdown("**Proposed steps** — review before I run anything:")
+                keep = []
+                for i, step in enumerate(st.session_state.design_cmd_plan):
+                    args_str = f" _(args: {step['args']})_" if step["args"] else ""
+                    checked = st.checkbox(f"**{step['tool']}** — {step.get('why','')}{args_str}",
+                                          value=True, key=f"design_cmd_step_{i}")
+                    if checked: keep.append(step)
+                rc1, rc2 = st.columns(2)
+                with rc1:
+                    if st.button("▶️ Run selected steps", type="primary", use_container_width=True, key="design_cmd_run"):
+                        auth = make_auth(wp_user, wp_pw)
+                        for step in keep:
+                            ok, msg = execute_agent_tool(step["tool"], step["args"], auth, domain, dry_run,
+                                                         uploaded_image=st.session_state.design_cmd_image)
+                            st.session_state.design_cmd_log.append({"role": "assistant", "text": ("✅ " if ok else "⚠️ ") + msg})
+                        st.session_state.design_cmd_plan = []
+                        st.session_state.design_wp_settings = None
+                        st.session_state.design_global_styles = None
+                        st.rerun()
+                with rc2:
+                    if st.button("✖️ Discard plan", use_container_width=True, key="design_cmd_discard"):
+                        st.session_state.design_cmd_plan = []
+                        st.session_state.design_cmd_log.append({"role": "assistant", "text": "Okay, discarded that plan."})
+                        st.rerun()
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            if st.session_state.design_cmd_log:
+                if st.button("🔄 Clear conversation", key="design_cmd_clear"):
+                    st.session_state.design_cmd_log = []
+                    st.session_state.design_cmd_plan = []
+                    st.session_state.design_cmd_image = None
+                    st.rerun()
 
         # ════════════════════════════════════════════════════
         # 1. SITE IDENTITY
