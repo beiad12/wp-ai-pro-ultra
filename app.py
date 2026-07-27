@@ -1,5 +1,5 @@
 import streamlit as st
-import requests, base64, json, time, urllib.parse, csv, os, threading, ssl, socket
+import requests, base64, json, time, urllib.parse, csv, os, threading, ssl, socket, re
 
 # Optional AI provider SDKs — imported lazily so a missing package only
 # disables that one provider instead of crashing the whole app.
@@ -912,6 +912,341 @@ def wp_install_plugin(slug, auth, target_domain, activate=True):
     except Exception as e:
         return False, friendly_error(e)
 
+# ════════════════════════════════════════════════════════════
+#  THEME & DESIGN HELPERS
+# ════════════════════════════════════════════════════════════
+def fetch_wp_settings(auth, target_domain):
+    """GET /wp-json/wp/v2/settings — requires manage_options on the
+    Application Password's user. Returns (settings_dict, error_message)."""
+    url = f"https://{target_domain}/wp-json/wp/v2/settings"
+    hdr = {"Authorization": f"Basic {auth}"}
+    try:
+        r = requests.get(url, headers=hdr, timeout=20)
+        if r.status_code == 200:
+            return r.json(), ""
+        return {}, f"HTTP {r.status_code}: {r.text[:300]}"
+    except Exception as e:
+        return {}, friendly_error(e)
+
+def update_wp_settings(fields, auth, target_domain):
+    """POST partial fields to /wp-json/wp/v2/settings. Returns (ok, message)
+    with the real response text on failure — never a generic error."""
+    url = f"https://{target_domain}/wp-json/wp/v2/settings"
+    hdr = {"Authorization": f"Basic {auth}", "Content-Type": "application/json"}
+    try:
+        r = requests.post(url, headers=hdr, json=fields, timeout=30)
+        if r.status_code == 200:
+            return True, "Saved."
+        return False, f"HTTP {r.status_code}: {r.text[:300]}"
+    except Exception as e:
+        return False, friendly_error(e)
+
+def generate_alt_text(title, prov, key, model, fb=False, fbk=None):
+    """Same alt-text prompt used in the Fix Images tab, factored out so
+    the Theme & Design media manager can reuse it instead of duplicating."""
+    raw = run_ai(f"SEO image alt text under 120 chars for '{title}'. No quotes.",
+                 prov, key, model, 0.1, enable_fallback=fb, fallback_keys=fbk)
+    return raw.replace('"', '').strip()
+
+def crop_square(img_bytes, size=512):
+    """Center-crops to a square and resizes to size x size — WordPress
+    requires the site icon to be square (512x512 recommended)."""
+    if PILImage is None:
+        raise ModuleNotFoundError("Pillow isn't installed. Run: python -m pip install Pillow")
+    im = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+    w, h = im.size
+    side = min(w, h)
+    left, top = (w - side) // 2, (h - side) // 2
+    im = im.crop((left, top, left + side, top + side)).resize((size, size), PILImage.LANCZOS)
+    out = io.BytesIO()
+    im.save(out, format="JPEG", quality=90)
+    return out.getvalue()
+
+def fetch_active_theme_info(auth, target_domain):
+    """GET /wp-json/wp/v2/themes?status=active — requires edit_theme_options
+    (or manage_options). Returns (theme_dict_or_None, error_message)."""
+    url = f"https://{target_domain}/wp-json/wp/v2/themes"
+    hdr = {"Authorization": f"Basic {auth}"}
+    try:
+        r = requests.get(url, headers=hdr, params={"status": "active"}, timeout=20)
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}: {r.text[:300]}"
+        data = r.json()
+        return (data[0], "") if data else (None, "No active theme returned.")
+    except Exception as e:
+        return None, friendly_error(e)
+
+def fetch_global_styles(theme_slug, auth, target_domain):
+    """Read-only resolved global styles (colors/typography) for a block
+    theme, via the stable core endpoint added in WP 6.0. Classic
+    (non-block) themes don't have one — callers should check first."""
+    url = f"https://{target_domain}/wp-json/wp/v2/global-styles/themes/{theme_slug}"
+    hdr = {"Authorization": f"Basic {auth}"}
+    try:
+        r = requests.get(url, headers=hdr, timeout=20)
+        if r.status_code == 200:
+            return r.json(), ""
+        return None, f"HTTP {r.status_code}: {r.text[:300]}"
+    except Exception as e:
+        return None, friendly_error(e)
+
+def find_user_global_styles_link(theme_info):
+    """The writable per-site Global Styles record isn't at a fixed URL —
+    it's discovered via the active theme's _links, the same mechanism the
+    Site Editor itself uses to bootstrap. Returns the href or None."""
+    links = (theme_info or {}).get("_links", {})
+    for rel, entries in links.items():
+        if "global-styles" in rel.lower():
+            for e in entries:
+                if e.get("href"):
+                    return e["href"]
+    return None
+
+PALETTE_PRESETS = {
+    "Navy / Cyan Fintech":            {"primary": "#0B1F3A", "secondary": "#0E2A52", "accent": "#22D3EE", "text": "#0B1220"},
+    "Charcoal / Gold Editorial":      {"primary": "#1C1C1C", "secondary": "#2A2A2A", "accent": "#C9A227", "text": "#1A1A1A"},
+    "Deep Blue / White Classic News": {"primary": "#0A2A66", "secondary": "#123B8F", "accent": "#FFFFFF", "text": "#111111"},
+}
+
+def build_style_variation_snippet(palette):
+    """Builds a valid theme.json-format 'settings.color.palette' + 'styles'
+    block for the chosen palette — the safe fallback the user can hand-paste
+    when a direct REST write isn't possible (classic theme, missing
+    capability, older WP version)."""
+    variation = {
+        "$schema": "https://schemas.wp.org/trunk/theme.json",
+        "version": 2,
+        "settings": {"color": {"palette": [
+            {"slug": "primary",   "name": "Primary",   "color": palette["primary"]},
+            {"slug": "secondary", "name": "Secondary", "color": palette["secondary"]},
+            {"slug": "accent",    "name": "Accent",    "color": palette["accent"]},
+            {"slug": "text",      "name": "Text",      "color": palette["text"]},
+        ]}},
+        "styles": {
+            "color": {"background": palette["primary"], "text": palette["text"]},
+            "elements": {
+                "link":   {"color": {"text": palette["accent"]}},
+                "button": {"color": {"background": palette["accent"], "text": palette["primary"]}},
+            },
+        },
+    }
+    return json.dumps(variation, indent=2)
+
+def apply_global_styles_colors(palette, auth, target_domain, theme_info):
+    """Best-effort direct write: reads the FULL existing Global Styles
+    object and writes it back with only the palette merged in — never a
+    blind partial patch, which risks wiping out settings the theme author
+    configured. Returns (ok, message)."""
+    href = find_user_global_styles_link(theme_info)
+    if not href:
+        return False, "This theme doesn't expose a writable Global Styles record (classic themes don't have one)."
+    hdr = {"Authorization": f"Basic {auth}"}
+    try:
+        r = requests.get(href, headers=hdr, timeout=20)
+        if r.status_code != 200:
+            return False, f"Couldn't read current Global Styles (HTTP {r.status_code}): {r.text[:300]}"
+        current = r.json()
+        if not current.get("id"):
+            return False, "Global Styles record has no id — can't safely write back."
+
+        settings = current.get("settings") or {}
+        color_settings = settings.get("color") or {}
+        kept = [c for c in (color_settings.get("palette") or [])
+                if c.get("slug") not in ("primary", "secondary", "accent", "text")]
+        color_settings["palette"] = kept + [
+            {"slug": "primary",   "name": "Primary",   "color": palette["primary"]},
+            {"slug": "secondary", "name": "Secondary", "color": palette["secondary"]},
+            {"slug": "accent",    "name": "Accent",    "color": palette["accent"]},
+            {"slug": "text",      "name": "Text",      "color": palette["text"]},
+        ]
+        settings["color"] = color_settings
+        current["settings"] = settings
+
+        styles = current.get("styles") or {}
+        styles["color"] = {"background": palette["primary"], "text": palette["text"]}
+        current["styles"] = styles
+
+        put_hdr = {"Authorization": f"Basic {auth}", "Content-Type": "application/json"}
+        pr = requests.post(href, headers=put_hdr, json=current, timeout=30)
+        if pr.status_code == 200:
+            return True, "Global Styles updated — check Appearance → Editor to confirm."
+        return False, f"HTTP {pr.status_code}: {pr.text[:300]}"
+    except Exception as e:
+        return False, friendly_error(e)
+
+def fetch_media_library(auth, target_domain, page=1, per_page=20):
+    """Paginated GET /wp-json/wp/v2/media. Returns (items, total_pages, error)."""
+    url = f"https://{target_domain}/wp-json/wp/v2/media"
+    hdr = {"Authorization": f"Basic {auth}"}
+    params = {"page": page, "per_page": per_page, "media_type": "image",
+              "_fields": "id,source_url,media_details,alt_text,title,mime_type,date"}
+    try:
+        r = requests.get(url, headers=hdr, params=params, timeout=30)
+        if r.status_code != 200:
+            return [], 0, f"HTTP {r.status_code}: {r.text[:300]}"
+        return r.json(), int(r.headers.get("X-WP-TotalPages", 1)), ""
+    except Exception as e:
+        return [], 0, friendly_error(e)
+
+def find_posts_using_media(media_item, posts):
+    """Cross-references only the currently loaded posts (there's no REST
+    'what uses this image' reverse lookup) — as a featured image, or as an
+    <img> inline in the content."""
+    used_in = []
+    src = media_item.get("source_url", "")
+    for p in posts:
+        if p.get("featured_media") == media_item["id"]:
+            used_in.append({"id": p["id"], "title": p["title"]["rendered"], "as": "featured image"})
+        elif src and src in p.get("content", {}).get("rendered", ""):
+            used_in.append({"id": p["id"], "title": p["title"]["rendered"], "as": "inline image"})
+    return used_in
+
+def repoint_media_references(old_media_item, new_media_id, new_url, posts, auth, target_domain, is_dry_run=True):
+    """After uploading a replacement image, points every loaded post that
+    used the old one (as featured image or inline <img>) at the new one."""
+    old_id, old_url = old_media_item["id"], old_media_item.get("source_url", "")
+    results = []
+    for p in posts:
+        pid, title = p["id"], p["title"]["rendered"]
+        payload, new_html = {}, None
+        html = p.get("content", {}).get("rendered", "")
+        if p.get("featured_media") == old_id:
+            payload["featured_media"] = new_media_id
+        if old_url and old_url in html:
+            new_html = html.replace(old_url, new_url)
+            payload["content"] = new_html
+        if not payload:
+            continue
+        if is_dry_run:
+            results.append({"id": pid, "title": title, "status": "ok",
+                             "detail": "Preview: would update " + ", ".join(payload.keys())})
+        else:
+            try:
+                wp_update_post(pid, payload, auth, target_domain)
+                if "featured_media" in payload: p["featured_media"] = new_media_id
+                if new_html is not None: p["content"]["rendered"] = new_html
+                results.append({"id": pid, "title": title, "status": "ok",
+                                 "detail": "Updated " + ", ".join(payload.keys())})
+            except Exception as e:
+                results.append({"id": pid, "title": title, "status": "error", "detail": friendly_error(e)})
+    return results
+
+def recompress_image(media_item, max_dimension=1600, quality=78, size_budget=400_000):
+    """Downloads an existing media item and re-encodes it if it's larger
+    than budget. Returns new JPEG bytes, or None if already within budget
+    (nothing to do)."""
+    if PILImage is None:
+        raise ModuleNotFoundError("Pillow isn't installed. Run: python -m pip install Pillow")
+    url = media_item.get("source_url")
+    if not url:
+        return None
+    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    original_size = len(r.content)
+    im = PILImage.open(io.BytesIO(r.content))
+    w, h = im.size
+    if max(w, h) <= max_dimension and original_size <= size_budget:
+        return None
+    if max(w, h) > max_dimension:
+        ratio = max_dimension / max(w, h)
+        im = im.resize((max(1, int(w * ratio)), max(1, int(h * ratio))), PILImage.LANCZOS)
+    out = io.BytesIO()
+    im.convert("RGB").save(out, format="JPEG", quality=quality, optimize=True)
+    return out.getvalue()
+
+def fetch_block_patterns(auth, target_domain):
+    """GET /wp-json/wp/v2/block-patterns/patterns — every pattern
+    registered by the active theme or any plugin, core endpoint since 5.5."""
+    url = f"https://{target_domain}/wp-json/wp/v2/block-patterns/patterns"
+    hdr = {"Authorization": f"Basic {auth}"}
+    try:
+        r = requests.get(url, headers=hdr, timeout=20)
+        if r.status_code == 200:
+            return r.json(), ""
+        return [], f"HTTP {r.status_code}: {r.text[:300]}"
+    except Exception as e:
+        return [], friendly_error(e)
+
+def find_ticker_patterns(patterns):
+    """Looks for a registered pattern that looks like a breaking-news
+    ticker or a crypto price ticker, by slug/title keyword. Returns
+    {'breaking': pattern_or_None, 'crypto': pattern_or_None}."""
+    hits = {"breaking": None, "crypto": None}
+    for p in patterns:
+        haystack = ((p.get("name") or "") + " " + (p.get("title") or "")).lower()
+        if hits["crypto"] is None and "crypto" in haystack:
+            hits["crypto"] = p
+        elif hits["breaking"] is None and ("breaking" in haystack or "ticker" in haystack):
+            hits["breaking"] = p
+    return hits
+
+def get_homepage_page_id(settings):
+    if settings.get("show_on_front") == "page" and settings.get("page_on_front"):
+        return settings["page_on_front"]
+    return None
+
+TICKER_MARKERS = {
+    "breaking": ("<!-- bemo:breaking-ticker:start -->", "<!-- bemo:breaking-ticker:end -->"),
+    "crypto":   ("<!-- bemo:crypto-ticker:start -->", "<!-- bemo:crypto-ticker:end -->"),
+}
+
+def check_ticker_enabled(kind, page_id, auth, target_domain):
+    """Reads the live homepage content to see whether our marker is already
+    there — so the on/off state shown to the user reflects reality instead
+    of assuming it starts disabled."""
+    start_marker, _ = TICKER_MARKERS[kind]
+    url = f"https://{target_domain}/wp-json/wp/v2/pages/{page_id}"
+    hdr = {"Authorization": f"Basic {auth}"}
+    try:
+        r = requests.get(url, headers=hdr, params={"context": "edit", "_fields": "content"}, timeout=20)
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}: {r.text[:300]}"
+        content = r.json().get("content", {})
+        raw = content.get("raw") or content.get("rendered") or ""
+        return start_marker in raw, ""
+    except Exception as e:
+        return None, friendly_error(e)
+
+def toggle_homepage_pattern(kind, enable, pattern, page_id, auth, target_domain, is_dry_run=True):
+    """Inserts (or removes) a registered block pattern's markup at the top
+    of the homepage, wrapped in an HTML comment marker so toggling it back
+    off finds and removes exactly what was inserted — nothing else on the
+    page is touched. Returns (ok, message)."""
+    start_marker, end_marker = TICKER_MARKERS[kind]
+    url = f"https://{target_domain}/wp-json/wp/v2/pages/{page_id}"
+    hdr = {"Authorization": f"Basic {auth}"}
+    try:
+        r = requests.get(url, headers=hdr, params={"context": "edit", "_fields": "content"}, timeout=20)
+        if r.status_code != 200:
+            return False, f"Couldn't read homepage (HTTP {r.status_code}): {r.text[:300]}"
+        content = r.json().get("content", {})
+        raw = content.get("raw") or content.get("rendered") or ""
+    except Exception as e:
+        return False, friendly_error(e)
+
+    if enable:
+        if start_marker in raw:
+            return True, "Already enabled."
+        new_content = f"{start_marker}\n{pattern.get('content', '')}\n{end_marker}\n{raw}"
+        msg_ok = "Added to the top of your homepage."
+    else:
+        if start_marker not in raw:
+            return True, "Already disabled."
+        block_re = re.compile(re.escape(start_marker) + r".*?" + re.escape(end_marker) + r"\n?", re.S)
+        new_content = block_re.sub("", raw)
+        msg_ok = "Removed from your homepage."
+
+    if is_dry_run:
+        return True, f"🟡 Sandbox preview — {msg_ok}"
+    try:
+        wr = requests.post(url, headers={**hdr, "Content-Type": "application/json"},
+                            json={"content": new_content}, timeout=30)
+        if wr.status_code == 200:
+            return True, msg_ok
+        return False, f"HTTP {wr.status_code}: {wr.text[:300]}"
+    except Exception as e:
+        return False, friendly_error(e)
+
 def apply_content_fix_now(post_ids, mode, auth, target_domain, extra_instructions="", is_dry_run=True):
     """Runs a real fix immediately (not a navigate-and-click-run detour) for
     a batch of post IDs. mode: 'image' | 'meta' | 'rewrite'.
@@ -1676,7 +2011,12 @@ for k, v in [("posts",[]),("selected",[]),("active_tab","dashboard"),
              ("health_content",None),("security_results",None),
              ("crawl_results",None),("cwv_results",None),
              ("content_quality_results",None),("prefill_fix_instructions",""),
-             ("_fix_toast",None),("agent_plan",[])]:
+             ("_fix_toast",None),("agent_plan",[]),
+             ("design_logo_preview",None),("design_favicon_preview",None),
+             ("design_media_page",1),("design_media_cache",None),
+             ("design_palette_preview",None),("design_theme_info",None),
+             ("design_global_styles",None),("design_wp_settings",None),
+             ("design_patterns",None),("design_ticker_state",{})]:
     if k not in st.session_state: st.session_state[k] = v
 
 # ════════════════════════════════════════════════════════════
@@ -2106,6 +2446,7 @@ TABS = [
     ("images",    "🖼️ Fix images"),
     ("create",    "✨ Create posts"),
     ("seo",       "🔍 SEO tools"),
+    ("design",    "🎨 Theme & Design"),
 ]
 
 tab_cols = st.columns(len(TABS))
@@ -3726,3 +4067,476 @@ elif active == "seo":
             prog.progress((i+1)/len(to_do))
             time.sleep(0.5)
         st.success("✅ SEO optimization complete!")
+
+
+# ════════════════════════════════════════════════════════════
+#  THEME & DESIGN TAB
+# ════════════════════════════════════════════════════════════
+elif active == "design":
+    posts = st.session_state.posts
+    render_stats()
+
+    st.markdown("""
+    <div class='section-head'>
+      <h3>🎨 Theme & Design</h3>
+      <span class='hint'>Site identity · Colors & typography · Media library · Homepage layout</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if not (domain and wp_user and wp_pw):
+        st.warning("⚠️ Connect your WordPress site in the sidebar first.")
+    else:
+        auth = make_auth(wp_user, wp_pw)
+        if dry_run:
+            st.info("🟡 Sandbox mode is ON — every change below previews only; nothing writes to WordPress until you turn Sandbox off in the sidebar.")
+
+        id_tab, color_tab, media_tab, layout_tab = st.tabs(
+            ["🏷️ Site Identity", "🎨 Color & Typography", "🖼️ Media Library", "📰 Homepage Layout"]
+        )
+
+        # ════════════════════════════════════════════════════
+        # 1. SITE IDENTITY
+        # ════════════════════════════════════════════════════
+        with id_tab:
+            if st.session_state.design_wp_settings is None:
+                with st.spinner("Loading site settings..."):
+                    settings, serr = fetch_wp_settings(auth, domain)
+                    st.session_state.design_wp_settings = settings or {}
+                    if serr:
+                        st.error(f"Couldn't load site settings: {serr}")
+
+            settings = st.session_state.design_wp_settings or {}
+            st.markdown("<div class='panel-box'>", unsafe_allow_html=True)
+            st.markdown("""<div class='panel-box-head'><h4>📝 Site title & tagline</h4>
+                <span class='hint'>/wp-json/wp/v2/settings</span></div>""", unsafe_allow_html=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                site_title = st.text_input("Site Title", value=settings.get("title", ""), key="design_site_title")
+            with c2:
+                tagline = st.text_input("Tagline", value=settings.get("description", ""), key="design_tagline")
+
+            if st.button("💾 Save site title & tagline", disabled=not settings, key="save_identity"):
+                if dry_run:
+                    st.warning(f"🟡 Sandbox preview — would set title=\"{site_title}\", tagline=\"{tagline}\".")
+                else:
+                    with st.spinner("Saving to WordPress..."):
+                        ok, msg = update_wp_settings({"title": site_title, "description": tagline}, auth, domain)
+                    if ok:
+                        st.session_state.design_wp_settings["title"] = site_title
+                        st.session_state.design_wp_settings["description"] = tagline
+                        st.success(f"✅ {msg}")
+                    else:
+                        st.error(f"❌ {msg}")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            # ---------- Logo ----------
+            st.markdown("<div class='panel-box' style='margin-top:14px'>", unsafe_allow_html=True)
+            st.markdown("""<div class='panel-box-head'><h4>🖼️ Site logo</h4>
+                <span class='hint'>Upload or AI-generate, preview before applying</span></div>""", unsafe_allow_html=True)
+
+            logo_mode = st.radio("Logo source", ["Upload a file", "Generate with AI"], horizontal=True, key="logo_mode")
+            if logo_mode == "Upload a file":
+                logo_file = st.file_uploader("Choose an image", type=["png", "jpg", "jpeg", "webp"], key="logo_upload")
+                if logo_file:
+                    st.session_state.design_logo_preview = logo_file.read()
+            else:
+                logo_prompt = st.text_input("Describe the logo you want",
+                    placeholder="Minimalist blue mountain peak, flat vector, transparent background", key="logo_prompt")
+                if st.button("🎨 Generate logo", disabled=not (logo_prompt and ai_key), key="gen_logo"):
+                    with st.spinner("Generating logo with AI..."):
+                        try:
+                            _use_dalle = image_provider == "DALL-E 3" and bool(dalle_key or ai_key)
+                            st.session_state.design_logo_preview = (
+                                gen_image_dalle(logo_prompt, dalle_key or ai_key, dalle_style) if _use_dalle
+                                else gen_image_pollinations(logo_prompt)
+                            )
+                        except Exception as e:
+                            st.error(f"Logo generation failed: {friendly_error(e)}")
+
+            if st.session_state.design_logo_preview:
+                st.image(st.session_state.design_logo_preview, width=240, caption="Preview — not applied yet")
+                if st.button("✅ Confirm & upload this logo", type="primary", key="confirm_logo"):
+                    if dry_run:
+                        st.warning("🟡 Sandbox preview — would upload this image to your media library and use it as the site logo.")
+                        st.session_state.design_logo_preview = None
+                    else:
+                        with st.spinner("Uploading logo to your media library..."):
+                            try:
+                                media_id = upload_wp_image(st.session_state.design_logo_preview, "Site Logo", "Site logo", auth, domain, True)
+                            except Exception as e:
+                                media_id = None
+                                st.error(f"Upload failed: {friendly_error(e)}")
+                        if media_id:
+                            st.success(f"✅ Uploaded to your media library (media ID {media_id}).")
+                            st.info(
+                                "WordPress doesn't expose the site logo (`custom_logo`) through the core REST API "
+                                "the way it does the site icon below — that's a real platform limitation, not "
+                                "something this app is skipping. Finish it in one click: **Appearance → Editor → "
+                                "Styles → Site Identity** (or **Customize → Site Identity** on classic themes) and "
+                                "pick the image you just uploaded — it'll be the most recent item in your Media Library."
+                            )
+                        st.session_state.design_logo_preview = None
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            # ---------- Site icon / favicon ----------
+            st.markdown("<div class='panel-box' style='margin-top:14px'>", unsafe_allow_html=True)
+            st.markdown("""<div class='panel-box-head'><h4>🔖 Site icon (favicon)</h4>
+                <span class='hint'>Auto-cropped to a 512×512 square</span></div>""", unsafe_allow_html=True)
+
+            icon_mode = st.radio("Icon source", ["Upload a file", "Generate with AI"], horizontal=True, key="icon_mode")
+            if icon_mode == "Upload a file":
+                icon_file = st.file_uploader("Choose an image", type=["png", "jpg", "jpeg", "webp"], key="icon_upload")
+                if icon_file:
+                    try:
+                        st.session_state.design_favicon_preview = crop_square(icon_file.read(), 512)
+                    except Exception as e:
+                        st.error(str(e))
+            else:
+                icon_prompt = st.text_input("Describe the icon",
+                    placeholder="Simple flat mountain peak icon, single color, no text", key="icon_prompt")
+                if st.button("🎨 Generate icon", disabled=not (icon_prompt and ai_key), key="gen_icon"):
+                    with st.spinner("Generating icon with AI..."):
+                        try:
+                            _use_dalle = image_provider == "DALL-E 3" and bool(dalle_key or ai_key)
+                            raw_bytes = (gen_image_dalle(icon_prompt, dalle_key or ai_key, dalle_style) if _use_dalle
+                                        else gen_image_pollinations(icon_prompt))
+                            st.session_state.design_favicon_preview = crop_square(raw_bytes, 512)
+                        except Exception as e:
+                            st.error(f"Icon generation failed: {friendly_error(e)}")
+
+            if st.session_state.design_favicon_preview:
+                st.image(st.session_state.design_favicon_preview, width=128, caption="512×512 preview")
+                if st.button("✅ Confirm & set as site icon", type="primary", key="confirm_icon"):
+                    if dry_run:
+                        st.warning("🟡 Sandbox preview — would upload this image and set it as the site icon.")
+                        st.session_state.design_favicon_preview = None
+                    else:
+                        with st.spinner("Uploading icon..."):
+                            try:
+                                media_id = upload_wp_image(st.session_state.design_favicon_preview, "Site Icon", "Site icon", auth, domain, True)
+                            except Exception as e:
+                                media_id = None
+                                st.error(f"Upload failed: {friendly_error(e)}")
+                        if media_id:
+                            with st.spinner("Setting as site icon..."):
+                                ok, msg = update_wp_settings({"site_icon": media_id}, auth, domain)
+                            if ok:
+                                st.success(f"✅ Site icon set (media ID {media_id}).")
+                            else:
+                                st.error(f"❌ {msg}")
+                        st.session_state.design_favicon_preview = None
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        # ════════════════════════════════════════════════════
+        # 2. COLOR & TYPOGRAPHY
+        # ════════════════════════════════════════════════════
+        with color_tab:
+            if st.session_state.design_theme_info is None:
+                with st.spinner("Detecting your active theme..."):
+                    theme_info, terr = fetch_active_theme_info(auth, domain)
+                    st.session_state.design_theme_info = theme_info or {}
+                    if terr:
+                        st.error(f"Couldn't detect the active theme: {terr}")
+
+            theme_info = st.session_state.design_theme_info or {}
+            theme_name = (theme_info.get("name") or {}).get("rendered") or "Unknown"
+            theme_slug = theme_info.get("stylesheet", "")
+
+            if theme_slug and st.session_state.design_global_styles is None:
+                with st.spinner("Reading current color palette from theme.json..."):
+                    gstyles, gerr = fetch_global_styles(theme_slug, auth, domain)
+                    st.session_state.design_global_styles = gstyles if gstyles else {}
+
+            gstyles = st.session_state.design_global_styles or {}
+            is_block_theme = bool(gstyles)
+
+            if not theme_info:
+                st.warning("Couldn't detect your active theme — this Application Password's user likely lacks `edit_theme_options`. You can still pick a palette and use the copy-paste snippet below.")
+            else:
+                st.markdown(f"**Active theme:** {theme_name}" +
+                            (" · 🧩 Global Styles available (block theme)" if is_block_theme else " · Classic theme — no theme.json / Global Styles"))
+
+            if is_block_theme:
+                current_palette = ((gstyles.get("settings") or {}).get("color") or {}).get("palette") or []
+                if current_palette:
+                    st.markdown("**Current palette:**")
+                    swatch_html = "".join(
+                        f"<div style='display:inline-flex;flex-direction:column;align-items:center;margin-right:14px;'>"
+                        f"<div style='width:36px;height:36px;border-radius:8px;background:{c.get('color','#ccc')};border:1px solid rgba(127,119,221,0.25)'></div>"
+                        f"<span style='font-size:11px;color:rgba(var(--muted-rgb),0.7);margin-top:4px'>{c.get('name','')}</span></div>"
+                        for c in current_palette[:8]
+                    )
+                    st.markdown(f"<div style='padding:6px 0 16px'>{swatch_html}</div>", unsafe_allow_html=True)
+            elif theme_info:
+                st.info("This classic theme has no theme.json, so there's no live palette to read. Pick a palette below to get a copy-paste snippet for your theme's own Customizer color options, or for when you switch to a block theme.")
+
+            preset_name = st.selectbox("Preset palette", list(PALETTE_PRESETS.keys()) + ["Custom"], key="palette_preset")
+            if preset_name == "Custom":
+                base = st.session_state.design_palette_preview or {"primary": "#1F2937", "secondary": "#374151", "accent": "#3B82F6", "text": "#111827"}
+                c1, c2, c3, c4 = st.columns(4)
+                with c1: primary = st.color_picker("Primary", base["primary"], key="pp_primary")
+                with c2: secondary = st.color_picker("Secondary", base["secondary"], key="pp_secondary")
+                with c3: accent = st.color_picker("Accent", base["accent"], key="pp_accent")
+                with c4: text_c = st.color_picker("Text", base["text"], key="pp_text")
+                palette = {"primary": primary, "secondary": secondary, "accent": accent, "text": text_c}
+            else:
+                palette = PALETTE_PRESETS[preset_name]
+                cols = st.columns(4)
+                for col, (label, hexval) in zip(cols, palette.items()):
+                    with col:
+                        st.markdown(
+                            f"<div style='text-align:center'><div style='width:100%;height:44px;border-radius:8px;"
+                            f"background:{hexval};border:1px solid rgba(127,119,221,0.25)'></div>"
+                            f"<span style='font-size:11px;color:rgba(var(--muted-rgb),0.7)'>{label.title()}: {hexval}</span></div>",
+                            unsafe_allow_html=True
+                        )
+            st.session_state.design_palette_preview = palette
+
+            st.markdown("**Live preview:**")
+            st.markdown(f"""
+            <div style='border-radius:14px;overflow:hidden;border:1px solid rgba(127,119,221,0.2);margin:10px 0 18px'>
+              <div style='background:{palette["primary"]};padding:16px 20px;'>
+                <div style='color:{palette["accent"]};font-weight:700;font-size:16px'>Your Site Name</div>
+                <div style='color:{palette["accent"]};opacity:0.8;font-size:12px'>Home · About · Blog · Contact</div>
+              </div>
+              <div style='background:#fff;padding:20px;'>
+                <div style='color:{palette["text"]};font-size:14px;font-weight:600;margin-bottom:6px'>A sample headline in your new palette</div>
+                <div style='color:{palette["text"]};opacity:0.75;font-size:13px;margin-bottom:12px'>Body content renders against a white content area on most block themes, regardless of the site-wide color scheme above.</div>
+                <span style='display:inline-block;background:{palette["accent"]};color:{palette["primary"]};padding:8px 16px;border-radius:8px;font-size:13px;font-weight:600'>Sample Button</span>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            snippet = build_style_variation_snippet(palette)
+            c1, c2 = st.columns(2)
+            with c1:
+                apply_disabled = not is_block_theme or dry_run
+                if st.button("⚡ Try direct apply (experimental)", disabled=apply_disabled,
+                             help="Only works on block themes with Global Styles exposed via REST, and only when Sandbox mode is off.",
+                             key="apply_global_styles"):
+                    with st.spinner("Writing to your site's Global Styles..."):
+                        ok, msg = apply_global_styles_colors(palette, auth, domain, theme_info)
+                    if ok:
+                        st.success(f"✅ {msg}")
+                        st.session_state.design_global_styles = None
+                    else:
+                        st.error(f"❌ {msg}")
+                if dry_run and is_block_theme:
+                    st.caption("🟡 Sandbox mode is on — turn it off in the sidebar to enable direct apply.")
+            with c2:
+                st.download_button("⬇️ Download style-variation.json", data=snippet,
+                                   file_name="style-variation.json", mime="application/json",
+                                   use_container_width=True, key="dl_snippet")
+
+            with st.expander("📋 Copy-paste snippet & instructions (always safe, works on any theme)"):
+                st.code(snippet, language="json")
+                st.markdown("""
+**Where to use this:**
+1. Save it as `style-variation.json` inside your active theme's `/styles/` folder (e.g. `wp-content/themes/your-theme/styles/style-variation.json`), then reload the Site Editor — it appears as a selectable style under **Appearance → Editor → Styles → Browse styles**.
+2. Or merge just the `settings.color.palette` array into your theme's existing `theme.json` under `settings.color.palette`, and the `styles.color` block under `styles.color`.
+3. Classic (non-block) themes don't read theme.json at all — use this as a reference for your theme's own Customizer color options instead (**Appearance → Customize → Colors**).
+                """)
+
+        # ════════════════════════════════════════════════════
+        # 3. PHOTO / IMAGE LIBRARY MANAGER
+        # ════════════════════════════════════════════════════
+        with media_tab:
+            no_img_posts = [p for p in posts if not p.get("featured_media")]
+            if no_img_posts:
+                st.markdown(f"<div class='hint' style='padding:0 0 10px'>⚠️ {len(no_img_posts)} loaded post(s) have no featured image</div>", unsafe_allow_html=True)
+                for p in no_img_posts[:10]:
+                    pid, title = p["id"], p["title"]["rendered"]
+                    c1, c2 = st.columns([4, 1])
+                    with c1:
+                        st.markdown(
+                            f"<div class='post-row-ui'><div class='post-thumb'>🚫</div>"
+                            f"<div class='post-info'><div class='post-title-ui'>{title}</div></div>"
+                            f"<span class='pill noimg'>no image</span></div>",
+                            unsafe_allow_html=True
+                        )
+                    with c2:
+                        if st.button("✨ Generate & Set", key=f"genimg_{pid}", disabled=not ai_key, use_container_width=True):
+                            with st.spinner(f"Generating a featured image for \"{title}\"..."):
+                                try:
+                                    raw = run_ai(f"2-sentence photorealistic image prompt for a blog post titled '{title}'. Raw text only.",
+                                                 provider, ai_key, ai_model, 0.1,
+                                                 enable_fallback=enable_fallback, fallback_keys=fallback_keys)
+                                    img_prompt = " ".join(raw.replace("*", "").replace('"', "").split())[:800]
+                                    alt = generate_alt_text(title, provider, ai_key, ai_model, enable_fallback, fallback_keys)
+                                    _use_dalle = image_provider == "DALL-E 3" and bool(dalle_key or ai_key)
+                                    img_bytes = (gen_image_dalle(img_prompt, dalle_key or ai_key, dalle_style) if _use_dalle
+                                                else gen_image_pollinations(img_prompt))
+                                    if dry_run:
+                                        st.image(img_bytes, width=200)
+                                        st.warning("🟡 Sandbox preview — image generated but not uploaded.")
+                                    else:
+                                        media_id = upload_wp_image(img_bytes, title, alt, auth, domain, optimize_seo_img)
+                                        wp_update_post(pid, {"featured_media": media_id}, auth, domain)
+                                        p["featured_media"] = media_id
+                                        st.success(f"✅ Featured image set for \"{title}\".")
+                                except Exception as e:
+                                    st.error(f"Failed: {friendly_error(e)}")
+                st.markdown("<hr style='border-color:rgba(127,119,221,0.15);margin:18px 0'>", unsafe_allow_html=True)
+
+            per_page = 12
+            page = st.session_state.design_media_page
+            pc1, pc2, pc3 = st.columns([1, 2, 1])
+            with pc1:
+                if st.button("◀ Previous", disabled=page <= 1, key="media_prev"):
+                    st.session_state.design_media_page -= 1
+                    st.session_state.design_media_cache = None
+                    st.rerun()
+            with pc2:
+                st.markdown(f"<div style='text-align:center;padding-top:6px'>Page {page}</div>", unsafe_allow_html=True)
+            with pc3:
+                if st.button("Next ▶", key="media_next"):
+                    st.session_state.design_media_page += 1
+                    st.session_state.design_media_cache = None
+                    st.rerun()
+
+            if st.session_state.design_media_cache is None:
+                with st.spinner(f"Loading media library page {page}..."):
+                    media_items, total_pages, merr = fetch_media_library(auth, domain, page, per_page)
+                    st.session_state.design_media_cache = (media_items, total_pages, merr)
+            media_items, total_pages, merr = st.session_state.design_media_cache
+
+            if merr:
+                st.error(f"Couldn't load media library: {merr}")
+            elif not media_items:
+                st.info("No images found in your media library.")
+            else:
+                st.caption(f"Page {page} of {total_pages}")
+                cols = st.columns(4)
+                for i, item in enumerate(media_items):
+                    with cols[i % 4]:
+                        st.image(item.get("source_url", ""), use_container_width=True)
+                        dims = item.get("media_details", {}) or {}
+                        w, h = dims.get("width", "?"), dims.get("height", "?")
+                        item_title = (item.get("title", {}) or {}).get("rendered", "(untitled)")
+                        st.caption(f"{item_title[:28]}\n{w}×{h}")
+                        used = find_posts_using_media(item, posts)
+                        st.caption(("Used in: " + ", ".join(u["title"][:20] for u in used[:2])) if used else "Not used in any loaded post")
+
+                        if not (item.get("alt_text") or "").strip():
+                            if st.button("🔍 Alt text", key=f"alt_{item['id']}", disabled=not ai_key, use_container_width=True):
+                                with st.spinner("Writing alt text..."):
+                                    try:
+                                        alt = generate_alt_text(item_title or "image", provider, ai_key, ai_model, enable_fallback, fallback_keys)
+                                        if dry_run:
+                                            st.warning(f"🟡 Preview: \"{alt}\"")
+                                        else:
+                                            ar = requests.post(f"https://{domain}/wp-json/wp/v2/media/{item['id']}",
+                                                               headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
+                                                               json={"alt_text": alt}, timeout=30)
+                                            if ar.status_code == 200:
+                                                st.success(f"✅ \"{alt}\"")
+                                            else:
+                                                st.error(f"HTTP {ar.status_code}: {ar.text[:200]}")
+                                    except Exception as e:
+                                        st.error(friendly_error(e))
+
+                        with st.expander("Replace / re-compress"):
+                            new_file = st.file_uploader("Upload replacement", type=["png", "jpg", "jpeg", "webp"], key=f"replace_{item['id']}")
+                            rc1, rc2 = st.columns(2)
+                            with rc1:
+                                if st.button("🔁 Replace", key=f"doreplace_{item['id']}", disabled=not new_file, use_container_width=True):
+                                    if dry_run:
+                                        st.warning("🟡 Sandbox preview — would upload a replacement and repoint any posts using this image.")
+                                    else:
+                                        with st.spinner("Uploading replacement and repointing posts..."):
+                                            try:
+                                                new_id = upload_wp_image(new_file.read(), item_title or "image", item.get("alt_text", ""), auth, domain, True)
+                                                nr = requests.get(f"https://{domain}/wp-json/wp/v2/media/{new_id}",
+                                                                 headers={"Authorization": f"Basic {auth}"}, params={"_fields": "source_url"}, timeout=20)
+                                                new_url = nr.json().get("source_url", "") if nr.status_code == 200 else ""
+                                                repoint_results = repoint_media_references(item, new_id, new_url, posts, auth, domain, is_dry_run=False)
+                                                st.success(f"✅ Replacement uploaded (media ID {new_id}). Updated {len(repoint_results)} post(s). The old image stays in your media library — remove it manually if you don't need it.")
+                                            except Exception as e:
+                                                st.error(friendly_error(e))
+                            with rc2:
+                                if st.button("📦 Re-compress", key=f"recompress_{item['id']}", use_container_width=True):
+                                    with st.spinner("Checking size and re-compressing if needed..."):
+                                        try:
+                                            new_bytes = recompress_image(item)
+                                            if new_bytes is None:
+                                                st.info("Already within size budget — nothing to do.")
+                                            elif dry_run:
+                                                st.warning(f"🟡 Sandbox preview — would re-compress to ~{len(new_bytes)//1024} KB and replace.")
+                                            else:
+                                                new_id = upload_wp_image(new_bytes, item_title or "image", item.get("alt_text", ""), auth, domain, True)
+                                                nr = requests.get(f"https://{domain}/wp-json/wp/v2/media/{new_id}",
+                                                                 headers={"Authorization": f"Basic {auth}"}, params={"_fields": "source_url"}, timeout=20)
+                                                new_url = nr.json().get("source_url", "") if nr.status_code == 200 else ""
+                                                repoint_results = repoint_media_references(item, new_id, new_url, posts, auth, domain, is_dry_run=False)
+                                                st.success(f"✅ Re-compressed to {len(new_bytes)//1024} KB (media ID {new_id}). Updated {len(repoint_results)} post(s).")
+                                        except Exception as e:
+                                            st.error(friendly_error(e))
+
+        # ════════════════════════════════════════════════════
+        # 4. HOMEPAGE / TICKER LAYOUT
+        # ════════════════════════════════════════════════════
+        with layout_tab:
+            if st.session_state.design_patterns is None:
+                with st.spinner("Checking your theme for ticker / breaking-news block patterns..."):
+                    patterns, perr = fetch_block_patterns(auth, domain)
+                    st.session_state.design_patterns = patterns
+                    if perr:
+                        st.error(f"Couldn't check block patterns: {perr}")
+            patterns = st.session_state.design_patterns or []
+            hits = find_ticker_patterns(patterns)
+
+            if st.session_state.design_wp_settings is None:
+                settings, serr = fetch_wp_settings(auth, domain)
+                st.session_state.design_wp_settings = settings or {}
+            page_id = get_homepage_page_id(st.session_state.design_wp_settings or {})
+
+            for kind, label, icon in [("breaking", "Breaking News Ticker", "📰"), ("crypto", "Crypto Price Ticker", "💹")]:
+                st.markdown("<div class='panel-box' style='margin-bottom:14px'>", unsafe_allow_html=True)
+                pattern = hits[kind]
+                if not pattern:
+                    st.markdown(f"""<div class='panel-box-head'><h4>{icon} {label}</h4>
+                        <span class='hint'>Not found on this site</span></div>""", unsafe_allow_html=True)
+                    st.warning(
+                        f"No block pattern for a {label.lower()} was found (checked every pattern registered by "
+                        f"your theme and plugins via the REST API). This app won't fake a toggle for something "
+                        f"that doesn't exist — install a ticker plugin, or add a custom block pattern with "
+                        f"'{kind}' or 'ticker' in its slug/title, then reload this tab."
+                    )
+                elif not page_id:
+                    st.markdown(f"""<div class='panel-box-head'><h4>{icon} {label}</h4>
+                        <span class='hint'>Pattern found: {pattern.get('title','')}</span></div>""", unsafe_allow_html=True)
+                    st.info("Your homepage currently shows your latest posts (not a static page) — this app can only insert a ticker into a static homepage. Set one under **Settings → Reading** in WP Admin first, then reload this tab.")
+                else:
+                    st.markdown(f"""<div class='panel-box-head'><h4>{icon} {label}</h4>
+                        <span class='hint'>Pattern found: {pattern.get('title','')}</span></div>""", unsafe_allow_html=True)
+                    known = st.session_state.design_ticker_state.get(kind)
+                    cc1, cc2 = st.columns([3, 1])
+                    with cc1:
+                        if known is None:
+                            st.caption("Status unknown — check before toggling.")
+                        else:
+                            pill_cls = "done" if known else "draft"
+                            pill_lbl = "● enabled" if known else "○ disabled"
+                            st.markdown(f"<span class='pill {pill_cls}'>{pill_lbl}</span>", unsafe_allow_html=True)
+                    with cc2:
+                        if st.button("🔄 Check status", key=f"check_{kind}", use_container_width=True):
+                            with st.spinner("Reading your live homepage..."):
+                                state, cerr = check_ticker_enabled(kind, page_id, auth, domain)
+                            if cerr:
+                                st.error(f"Couldn't check status: {cerr}")
+                            else:
+                                st.session_state.design_ticker_state[kind] = state
+                                st.rerun()
+
+                    if known is not None:
+                        action_label = f"🔴 Disable {label}" if known else f"🟢 Enable {label}"
+                        if st.button(action_label, key=f"apply_{kind}"):
+                            with st.spinner("Updating your homepage..."):
+                                ok, msg = toggle_homepage_pattern(kind, not known, pattern, page_id, auth, domain, is_dry_run=dry_run)
+                            if ok:
+                                st.success(f"✅ {msg}")
+                                if not dry_run:
+                                    st.session_state.design_ticker_state[kind] = not known
+                            else:
+                                st.error(f"❌ {msg}")
+                st.markdown("</div>", unsafe_allow_html=True)
