@@ -1,6 +1,16 @@
 import streamlit as st
 import requests, base64, json, time, urllib.parse, csv, os, threading, ssl, socket, re
 
+# Lets a background worker thread safely touch st.session_state — the officially
+# documented pattern for background threads in Streamlit. Falls back to a no-op
+# on very old Streamlit versions where background plan execution just won't be
+# offered (checked at call time via _BG_CTX_OK below).
+try:
+    from streamlit.runtime.scriptrunner import add_script_run_ctx as _add_script_run_ctx
+    _BG_CTX_OK = True
+except ImportError:
+    _BG_CTX_OK = False
+
 # Optional AI provider SDKs — imported lazily so a missing package only
 # disables that one provider instead of crashing the whole app.
 try:
@@ -909,6 +919,107 @@ def wp_install_plugin(slug, auth, target_domain, activate=True):
         return False, (detail or
             f"HTTP {r.status_code} — your host likely requires FTP credentials for plugin installs "
             f"(common on shared hosting). Install '{slug}' manually: WP Admin → Plugins → Add New → search, install, activate.")
+    except Exception as e:
+        return False, friendly_error(e)
+
+# ════════════════════════════════════════════════════════════
+#  GROWTH & DATA HELPERS (Pinterest / keyword research / analytics)
+#  All three need a real, paid or free-tier third-party account —
+#  same pattern as the PageSpeed/DALL-E keys above: paste your own
+#  key/token in the sidebar, nothing is faked if it's missing.
+# ════════════════════════════════════════════════════════════
+def post_to_pinterest(image_url, title, description, link, board_id, access_token):
+    """Creates a Pinterest Pin via the Pinterest API v5. Requires a Pinterest
+    access token (Developers → your app → Generate token) and a board ID
+    (visible in the board's URL). Returns (ok, message)."""
+    if not access_token or not board_id:
+        return False, ("Pinterest isn't configured — add a Pinterest access token and board ID "
+                       "in the sidebar under GROWTH & DATA APIs.")
+    if not image_url:
+        return False, "This post has no image to pin — add a featured image first."
+    try:
+        r = requests.post(
+            "https://api.pinterest.com/v5/pins",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={"board_id": board_id, "title": title[:100], "description": description[:500],
+                  "link": link, "media_source": {"source_type": "image_url", "url": image_url}},
+            timeout=30)
+        if r.status_code in (200, 201):
+            data = r.json()
+            return True, f"Pinned to board — pin id {data.get('id','?')}. https://pinterest.com/pin/{data.get('id','')}/"
+        try: detail = r.json().get("message", r.text[:200])
+        except Exception: detail = r.text[:200]
+        return False, f"Pinterest API error (HTTP {r.status_code}): {detail}"
+    except Exception as e:
+        return False, friendly_error(e)
+
+def keyword_research_dataforseo(keyword, login, password, location_code=2840, language_code="en"):
+    """Looks up search volume / CPC / competition for a keyword via DataForSEO's
+    Google Ads search-volume endpoint. Requires a DataForSEO login+password
+    (dataforseo.com, pay-as-you-go). Returns (ok, data-dict-or-message)."""
+    if not login or not password:
+        return False, ("Keyword research isn't configured — add your DataForSEO login and password "
+                       "in the sidebar under GROWTH & DATA APIs.")
+    try:
+        r = requests.post(
+            "https://api.dataforseo.com/v3/keywords_data/google_ads/search_volume/live",
+            auth=(login, password), timeout=30,
+            json=[{"keywords": [keyword], "location_code": location_code, "language_code": language_code}])
+        if r.status_code != 200:
+            return False, f"DataForSEO error (HTTP {r.status_code}): {r.text[:200]}"
+        data = r.json()
+        tasks = data.get("tasks") or []
+        if not tasks or not tasks[0].get("result"):
+            return False, "No data returned for that keyword — check spelling or try a broader term."
+        result = tasks[0]["result"][0]
+        return True, {
+            "keyword": result.get("keyword", keyword),
+            "search_volume": result.get("search_volume"),
+            "competition": result.get("competition"),
+            "cpc": result.get("cpc"),
+            "monthly_trend": [m.get("search_volume") for m in (result.get("monthly_searches") or [])[-6:]],
+        }
+    except Exception as e:
+        return False, friendly_error(e)
+
+def fetch_ga4_report(property_id, access_token, days=28):
+    """Pulls a basic traffic summary (sessions, active users, top pages) from
+    the Google Analytics 4 Data API. Requires a GA4 property ID and a Google
+    OAuth access token pasted in the sidebar — access tokens expire in about
+    an hour, so this needs a fresh one from Google's OAuth Playground or your
+    own token-refresh setup each time. Returns (ok, data-dict-or-message)."""
+    if not property_id or not access_token:
+        return False, ("Analytics isn't configured — add a GA4 property ID and access token in the "
+                       "sidebar under GROWTH & DATA APIs.")
+    try:
+        r = requests.post(
+            f"https://analyticsdata.googleapis.com/v1beta/properties/{property_id}:runReport",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={
+                "dateRanges": [{"startDate": f"{days}daysAgo", "endDate": "today"}],
+                "dimensions": [{"name": "pagePath"}],
+                "metrics": [{"name": "sessions"}, {"name": "activeUsers"}, {"name": "screenPageViews"}],
+                "orderBys": [{"metric": {"metricName": "sessions"}, "desc": True}],
+                "limit": 10,
+            }, timeout=30)
+        if r.status_code != 200:
+            try: detail = r.json().get("error", {}).get("message", r.text[:200])
+            except Exception: detail = r.text[:200]
+            return False, f"Google Analytics error (HTTP {r.status_code}): {detail}"
+        data = r.json()
+        rows = data.get("rows") or []
+        top_pages = [{"path": row["dimensionValues"][0]["value"],
+                      "sessions": row["metricValues"][0]["value"],
+                      "users": row["metricValues"][1]["value"],
+                      "views": row["metricValues"][2]["value"]} for row in rows]
+        totals = (data.get("totals") or [{}])[0].get("metricValues", [])
+        return True, {
+            "days": days,
+            "total_sessions": totals[0]["value"] if len(totals) > 0 else None,
+            "total_users": totals[1]["value"] if len(totals) > 1 else None,
+            "total_views": totals[2]["value"] if len(totals) > 2 else None,
+            "top_pages": top_pages,
+        }
     except Exception as e:
         return False, friendly_error(e)
 
@@ -2017,7 +2128,8 @@ for k, v in [("posts",[]),("selected",[]),("active_tab","dashboard"),
              ("design_palette_preview",None),("design_theme_info",None),
              ("design_global_styles",None),("design_wp_settings",None),
              ("design_patterns",None),("design_ticker_state",{}),
-             ("design_cmd_image",None),("design_cmd_log",[]),("design_cmd_plan",[])]:
+             ("design_cmd_image",None),("design_cmd_log",[]),("design_cmd_plan",[]),
+             ("agent_bg_job",None)]:
     if k not in st.session_state: st.session_state[k] = v
 
 # ════════════════════════════════════════════════════════════
@@ -2026,56 +2138,78 @@ for k, v in [("posts",[]),("selected",[]),("active_tab","dashboard"),
 #  code itself; it only proposes {tool, args} steps from this exact list,
 #  which get shown to the user for confirmation before anything real runs.
 # ════════════════════════════════════════════════════════════
+# ── Master tool registry ────────────────────────────────────
+# Every tool the AI Agent can call, across the whole app, tagged by domain
+# so the plan UI and any future reporting can group them. This is the single
+# source of truth for the general Agent tab. The Theme & Design tab's own
+# command box uses DESIGN_TOOLS below instead — a filtered view containing
+# only the "design" group — so it can never select anything outside that scope.
 AGENT_TOOLS = {
-    "load_posts": {
+    "load_posts": {"group": "content",
         "desc": "Fetch posts from WordPress into memory. Args: statuses (list of 'publish'/'draft'/'private', "
                 "default ['publish']), max_count (int, 0 = all, default 0)."},
-    "run_full_audit": {
+    "run_full_audit": {"group": "health",
         "desc": "Run the full site health audit — technical, security, performance, SEO crawl, content quality. No args."},
-    "fix_missing_images": {
+    "improve_website": {"group": "health",
+        "desc": "Run the full site audit, then automatically apply whatever real fixes match what it finds — "
+                "missing featured images, thin/stale content, missing SEO meta, missing image dimensions. "
+                "This is the 'improve my website' one-shot tool. No args."},
+    "fix_missing_images": {"group": "images",
         "desc": "Generate & upload AI featured images with SEO alt text for posts missing one. "
                 "Args: max_count (int, 0 = all, default 0)."},
-    "rewrite_thin_stale_content": {
+    "rewrite_thin_stale_content": {"group": "content",
         "desc": "AI-rewrite posts that are thin (under the quality-gate word count) or stale (not updated "
                 "recently). Args: max_count (int, 0 = all, default 0), instructions (optional extra rewrite instructions)."},
-    "fix_seo_meta": {
+    "fix_seo_meta": {"group": "seo",
         "desc": "Generate and push a meta description + focus keyword to Yoast/RankMath for posts missing one. "
                 "Args: max_count (int, 0 = all, default 0)."},
-    "fix_image_dimensions": {
+    "fix_image_dimensions": {"group": "images",
         "desc": "Scan post images missing width/height attributes and write real pixel dimensions to fix "
                 "layout shift (CLS). No args."},
-    "install_caching_plugin": {
+    "install_caching_plugin": {"group": "health",
         "desc": "Install & activate a verified caching plugin (WP Super Cache) to speed up LCP/FCP. "
                 "Requires Sandbox mode OFF. No args."},
-    "harden_security": {
+    "harden_security": {"group": "health",
         "desc": "Install & activate verified security plugins (Disable XML-RPC, Really Simple Security). "
                 "Requires Sandbox mode OFF. No args."},
-    "generate_pdf_report": {
+    "generate_pdf_report": {"group": "health",
         "desc": "Build a branded PDF report from the most recent scan results. No args."},
-    "create_post": {
+    "create_post": {"group": "content",
         "desc": "Write and publish one new AI-generated blog post with SEO meta, a featured image, and schema.org "
                 "markup. Args: topic (string, required), word_count (int, default 800), "
                 "publish (bool, default false — false publishes as a draft for review)."},
+    "create_posts_batch": {"group": "content",
+        "desc": "Write and publish several AI-generated blog posts in one run. Args: topics (list of strings) "
+                "— OR topic_theme (string) + topic_count (int) to have the AI brainstorm that many titles first "
+                "— plus word_count (int, default 800) and publish (bool, default false)."},
+    "set_site_title_tagline": {"group": "design",
+        "desc": "Update the site title and/or tagline. Args: title (optional string), tagline (optional string)."},
+    "set_site_logo": {"group": "design",
+        "desc": "Set the site logo — uses the attached image if one was uploaded, otherwise generates one from "
+                "a text description. Args: prompt (string describing the logo, only used if no image is attached)."},
+    "set_site_icon": {"group": "design",
+        "desc": "Set the site icon/favicon, auto-cropped to a 512x512 square — uses the attached image if one was "
+                "uploaded, otherwise generates one from a text description. Args: prompt (string, only used if no "
+                "image is attached)."},
+    "apply_color_palette": {"group": "design",
+        "desc": "Apply a color palette to the site's design. Args: preset (one of: " + ", ".join(PALETTE_PRESETS) +
+                "), OR primary/secondary/accent/text (hex color strings, for a custom palette not matching a preset)."},
+    "post_to_pinterest": {"group": "social",
+        "desc": "Create a Pinterest Pin from a post's featured image. Args: post_id (int, required — must already "
+                "be loaded). Requires a Pinterest access token + board ID configured in the sidebar."},
+    "keyword_research": {"group": "seo",
+        "desc": "Look up monthly search volume, competition, and CPC for a keyword or topic. Args: keyword "
+                "(string, required). Requires a DataForSEO login/password configured in the sidebar."},
+    "fetch_analytics_report": {"group": "analytics",
+        "desc": "Pull a traffic summary (sessions, users, top pages) from Google Analytics 4 for the last N days. "
+                "Args: days (int, default 28). Requires a GA4 property ID + access token configured in the sidebar."},
 }
 
 # A separate, deliberately narrow registry for the Theme & Design tab's own
 # command box — it should only ever touch branding/identity/color, never
 # posts, SEO, security, or caching. Passed to run_agent_planner instead of
 # AGENT_TOOLS so the model can't select anything outside this scope.
-DESIGN_TOOLS = {
-    "set_site_title_tagline": {
-        "desc": "Update the site title and/or tagline. Args: title (optional string), tagline (optional string)."},
-    "set_site_logo": {
-        "desc": "Set the site logo — uses the attached image if one was uploaded, otherwise generates one from "
-                "a text description. Args: prompt (string describing the logo, only used if no image is attached)."},
-    "set_site_icon": {
-        "desc": "Set the site icon/favicon, auto-cropped to a 512x512 square — uses the attached image if one was "
-                "uploaded, otherwise generates one from a text description. Args: prompt (string, only used if no "
-                "image is attached)."},
-    "apply_color_palette": {
-        "desc": "Apply a color palette to the site's design. Args: preset (one of: " + ", ".join(PALETTE_PRESETS) +
-                "), OR primary/secondary/accent/text (hex color strings, for a custom palette not matching a preset)."},
-}
+DESIGN_TOOLS = {name: meta for name, meta in AGENT_TOOLS.items() if meta["group"] == "design"}
 
 def run_agent_planner(user_request, context_summary, tools=None):
     """Asks the connected LLM to turn a free-text request into a short plan of
@@ -2250,6 +2384,93 @@ def execute_agent_tool(tool, args, auth, domain, is_dry_run, uploaded_image=None
             return True, f"Created post #{r['post_id']} — {r['link']} ✅"
         return False, f"Couldn't create the post: {r['error']}"
 
+    if tool == "create_posts_batch":
+        if not ai_key: return False, "I need an AI API key in the sidebar first."
+        topics = args.get("topics")
+        if isinstance(topics, str):
+            topics = [t.strip() for t in topics.split(",") if t.strip()]
+        if not topics:
+            theme = (args.get("topic_theme") or "").strip()
+            count = int(args.get("topic_count") or 0)
+            if not theme or not count:
+                return False, "Give me either a list of topics, or a theme plus how many to write."
+            count = min(count, 20)
+            try:
+                raw = run_ai(f"Give me {count} distinct, specific blog post title ideas about: {theme}. "
+                             f"Reply with exactly {count} lines, one title per line, no numbering, no extra text.",
+                             provider, ai_key, ai_model, 0.7, "You are a content strategist.",
+                             enable_fallback, fallback_keys)
+                topics = [t.strip("-•* ").strip() for t in raw.strip().split("\n") if t.strip()][:count]
+            except Exception as e:
+                return False, f"Couldn't generate topic ideas: {friendly_error(e)}"
+        if not topics:
+            return False, "No topics to write about."
+        word_count = int(args.get("word_count") or 800)
+        publish = bool(args.get("publish"))
+        if is_dry_run:
+            return True, f"🟡 Sandbox preview — would create {len(topics)} post(s): " + "; ".join(topics)
+        lines, ok_n = [], 0
+        for topic in topics:
+            r = build_and_publish_post(topic, domain, auth, word_count=word_count,
+                                       wp_status=("publish" if publish else "draft"), is_dry_run=is_dry_run)
+            if r["ok"]:
+                ok_n += 1
+                lines.append(f"#{r['post_id']} {topic} — {r['link']}")
+            else:
+                lines.append(f"❌ {topic}: {r['error']}")
+        return True, f"Created {ok_n}/{len(topics)} post(s):\n" + "\n".join(f"- {l}" for l in lines)
+
+    if tool == "improve_website":
+        if not st.session_state.posts:
+            ok, msg = execute_agent_tool("load_posts", {}, auth, domain, is_dry_run)
+            if not ok: return False, msg
+        _, audit_msg = execute_agent_tool("run_full_audit", {}, auth, domain, is_dry_run)
+        report = [f"🩺 Audit — {audit_msg}"]
+        for sub_tool in ("fix_missing_images", "fix_seo_meta", "fix_image_dimensions", "rewrite_thin_stale_content"):
+            ok, msg = execute_agent_tool(sub_tool, {}, auth, domain, is_dry_run)
+            report.append(f"{'✅' if ok else '⚠️'} {sub_tool} — {msg}")
+        return True, "Ran a full improvement pass:\n\n" + "\n".join(f"- {r}" for r in report)
+
+    if tool == "post_to_pinterest":
+        post_id = args.get("post_id")
+        post = next((p for p in st.session_state.posts if p["id"] == post_id), None) if post_id else None
+        if not post:
+            return False, "I need a post_id from your loaded posts to pin — load posts first."
+        image_url = (post.get("_embedded", {}).get("wp:featuredmedia", [{}])[0] or {}).get("source_url")
+        if not image_url:
+            return False, "That post has no featured image to pin."
+        title = BeautifulSoup(post.get("title", {}).get("rendered", ""), "html.parser").get_text()
+        desc = BeautifulSoup(post.get("excerpt", {}).get("rendered", ""), "html.parser").get_text()
+        link = post.get("link", f"https://{domain}/")
+        if is_dry_run:
+            return True, f"🟡 Sandbox preview — would pin '{title}' to your Pinterest board."
+        return post_to_pinterest(image_url, title, desc or title, link,
+                                 st.session_state.get("cfg_pinterest_board_id", ""),
+                                 st.session_state.get("cfg_pinterest_token", ""))
+
+    if tool == "keyword_research":
+        keyword = (args.get("keyword") or "").strip()
+        if not keyword:
+            return False, "Tell me which keyword or topic to look up."
+        ok, data = keyword_research_dataforseo(keyword, st.session_state.get("cfg_dataforseo_login", ""),
+                                               st.session_state.get("cfg_dataforseo_password", ""))
+        if not ok: return False, data
+        trend = ", ".join(str(v) for v in data["monthly_trend"]) if data.get("monthly_trend") else "n/a"
+        return True, (f"**{data['keyword']}** — {data['search_volume']:,} searches/mo" if data.get("search_volume") is not None
+                      else f"**{data['keyword']}**") + \
+                     f"\ncompetition: {data.get('competition')}, CPC: ${data.get('cpc')}\nrecent trend: {trend}"
+
+    if tool == "fetch_analytics_report":
+        days = int(args.get("days") or 28)
+        ok, data = fetch_ga4_report(st.session_state.get("cfg_ga4_property_id", ""),
+                                    st.session_state.get("cfg_ga4_access_token", ""), days)
+        if not ok: return False, data
+        lines = [f"Last {data['days']} days — {data.get('total_sessions','?')} sessions, "
+                 f"{data.get('total_users','?')} users, {data.get('total_views','?')} views."]
+        for pg in data.get("top_pages", [])[:5]:
+            lines.append(f"  {pg['path']} — {pg['sessions']} sessions")
+        return True, "\n".join(lines)
+
     if tool == "set_site_title_tagline":
         title, tagline = args.get("title"), args.get("tagline")
         if not title and not tagline:
@@ -2323,6 +2544,25 @@ def execute_agent_tool(tool, args, auth, domain, is_dry_run, uploaded_image=None
         return True, msg
 
     return False, f"Unknown tool: {tool}"
+
+def _agent_plan_worker(job, steps, auth, domain, is_dry_run):
+    """Runs an approved plan step-by-step on a background thread so a long
+    job (batch content creation, a full audit + fixes, ...) doesn't freeze the
+    UI. `job` is the same dict object living in st.session_state.agent_bg_job
+    — the thread was given script-run context via add_script_run_ctx, which
+    is Streamlit's documented way to let a background thread touch
+    st.session_state safely. There's no push-based UI update: results appear
+    the next time you interact with the app (or hit the Refresh button),
+    which is why the UI is honest about that instead of promising live
+    push updates Streamlit can't actually do."""
+    for i, step in enumerate(steps):
+        try:
+            ok, msg = execute_agent_tool(step["tool"], step["args"], auth, domain, is_dry_run)
+        except Exception as e:
+            ok, msg = False, friendly_error(e)
+        job["log"].append({"tool": step["tool"], "ok": ok, "msg": msg})
+        job["done_n"] = i + 1
+    job["status"] = "done"
 
 # ════════════════════════════════════════════════════════════
 #  SIDEBAR
@@ -2474,6 +2714,27 @@ with st.sidebar:
                                        help="How many live post URLs to crawl for the site-wide SEO scan.")
     stale_days     = st.number_input("Flag content stale after (days)", min_value=30, max_value=1095,
                                       value=180, step=30, label_visibility="collapsed")
+
+    st.markdown("GROWTH & DATA APIs")
+    with st.expander("📌 Pinterest, 🔑 keyword research, 📊 analytics (all optional)"):
+        st.caption("Paste your own key/token for each — same pattern as the PageSpeed key above. "
+                    "Nothing here is faked; leave any of these blank and that tool just says it isn't configured.")
+        pinterest_token = st.text_input("Pinterest access token", type="password", key="cfg_pinterest_token",
+                                        placeholder="From Pinterest Developers → your app → Generate token")
+        pinterest_board_id = st.text_input("Pinterest board ID", key="cfg_pinterest_board_id",
+                                           placeholder="Found in the board's URL")
+        st.markdown("—")
+        dataforseo_login = st.text_input("DataForSEO login", key="cfg_dataforseo_login",
+                                         placeholder="dataforseo.com account login")
+        dataforseo_password = st.text_input("DataForSEO password", type="password", key="cfg_dataforseo_password",
+                                            placeholder="dataforseo.com account password")
+        st.markdown("—")
+        ga4_property_id = st.text_input("GA4 property ID", key="cfg_ga4_property_id",
+                                        placeholder="e.g. 123456789")
+        ga4_access_token = st.text_input("GA4 access token", type="password", key="cfg_ga4_access_token",
+                                         placeholder="OAuth token — expires ~1hr, from OAuth Playground",
+                                         help="Google Analytics tokens expire quickly. Generate a fresh one at "
+                                              "developers.google.com/oauthplayground with the analytics.readonly scope.")
 
     st.markdown("RUN")
     post_status   = st.multiselect("Post status", ["publish","draft","private"],
@@ -2941,10 +3202,12 @@ if active == "dashboard":
         keep = []
         for i, step in enumerate(st.session_state.agent_plan):
             args_str = f" _(args: {step['args']})_" if step["args"] else ""
-            checked = st.checkbox(f"**{step['tool']}** — {step.get('why','')}{args_str}",
+            group = AGENT_TOOLS.get(step["tool"], {}).get("group", "")
+            group_tag = f"`{group}` " if group else ""
+            checked = st.checkbox(f"{group_tag}**{step['tool']}** — {step.get('why','')}{args_str}",
                                    value=True, key=f"agent_plan_step_{i}")
             if checked: keep.append(step)
-        pc1, pc2 = st.columns(2)
+        pc1, pc2, pc3 = st.columns(3)
         with pc1:
             if st.button("▶️ Run selected steps", type="primary", use_container_width=True, key="agent_plan_run"):
                 auth = make_auth(wp_user, wp_pw) if (wp_user and wp_pw) else None
@@ -2954,9 +3217,45 @@ if active == "dashboard":
                 st.session_state.agent_plan = []
                 st.rerun()
         with pc2:
+            if st.button("🧵 Run in background", use_container_width=True, key="agent_plan_run_bg",
+                         disabled=not _BG_CTX_OK, help="Keeps the app usable while a long plan (e.g. a batch of "
+                         "posts, or a full audit + fixes) runs. Progress shows up whenever you interact with the "
+                         "app — there's no push-based live update, that's not something Streamlit can do."):
+                auth = make_auth(wp_user, wp_pw) if (wp_user and wp_pw) else None
+                job = {"log": [], "done_n": 0, "total": len(keep), "status": "running"}
+                st.session_state.agent_bg_job = job
+                t = threading.Thread(target=_agent_plan_worker, args=(job, keep, auth, domain, dry_run), daemon=True)
+                _add_script_run_ctx(t)
+                t.start()
+                st.session_state.agent_plan = []
+                _agent_say(f"Started {len(keep)} step(s) in the background — I'll keep working while you do other "
+                           f"things. Check back in this tab for progress.")
+                st.rerun()
+        with pc3:
             if st.button("✖️ Discard plan", use_container_width=True, key="agent_plan_discard"):
                 st.session_state.agent_plan = []
                 _agent_say("Okay, discarded that plan.")
+                st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Background job status — no live push, refreshes on any interaction ──
+    if st.session_state.agent_bg_job:
+        job = st.session_state.agent_bg_job
+        st.markdown("<div class='panel-box' style='margin-top:10px'>", unsafe_allow_html=True)
+        running = job["status"] == "running"
+        st.markdown(f"**{'🧵 Running in background…' if running else '✅ Background job finished'}** "
+                    f"— {job['done_n']}/{job['total']} step(s)")
+        st.progress(job["done_n"] / job["total"] if job["total"] else 1.0)
+        for entry in job["log"]:
+            st.markdown(("✅ " if entry["ok"] else "⚠️ ") + f"**{entry['tool']}** — {entry['msg']}")
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            if running:
+                st.button("🔄 Refresh status", use_container_width=True, key="agent_bg_refresh")
+                st.caption("Updates whenever you interact with the app — feel free to keep chatting or switch tabs.")
+        with bc2:
+            if not running and st.button("Dismiss", use_container_width=True, key="agent_bg_dismiss"):
+                st.session_state.agent_bg_job = None
                 st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
